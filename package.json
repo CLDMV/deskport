@@ -5,8 +5,15 @@
 	"version": "0.2.0",
 	"publisher": "cldmv",
 	"icon": "resources/logo.png",
-	"private": true,
 	"license": "SEE LICENSE IN LICENSE",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/CLDMV/deskport.git"
+	},
+	"bugs": {
+		"url": "https://github.com/CLDMV/deskport/issues"
+	},
+	"homepage": "https://github.com/CLDMV/deskport#readme",
 	"engines": {
 		"vscode": "^1.85.0"
 	},
@@ -36,7 +43,9 @@
 	},
 	"scripts": {
 		"compile": "tsc -p .configs/tsconfig.json",
-		"package": "pnpm run compile && vsce package --no-dependencies --allow-missing-repository -o remote-dev-launcher.vsix"
+		"package": "pnpm run compile && vsce package --no-dependencies -o remote-dev-launcher.vsix",
+		"install-local": "pnpm run package && code --install-extension remote-dev-launcher.vsix --force",
+		"publish": "pnpm run compile && vsce publish --no-dependencies"
 	},
 	"devDependencies": {
 		"@types/node": "^22.13.5",
