@@ -4,6 +4,7 @@
 	"description": "Sync an SSH-remote workspace to your local machine and launch configured dev targets — for Electron and other GUI apps that must run where the display is.",
 	"version": "0.2.0",
 	"publisher": "cldmv",
+	"icon": "resources/logo.png",
 	"private": true,
 	"license": "SEE LICENSE IN LICENSE",
 	"engines": {
