@@ -79,6 +79,28 @@ Now `npm run launchLocal1` on the remote → the local extension mirrors the rep
 and launches that target on your machine. While a target runs, a file watcher
 copies each remote edit so it hot-reloads.
 
+## Settings
+
+The extension reads its settings from VSCode itself — there is no separate UI.
+Open **Settings** and search for "Remote Dev Launcher":
+
+- **`remoteDevLauncher.clonePath`** — base directory on the **local machine**
+  where remote workspaces are mirrored. Each project gets a subfolder named by
+  its `mirrorName`. Empty (the default) means `~/.devlauncher-mirrors`; a
+  leading `~` expands to your home directory.
+
+Because it is a local path, set it once in **User** settings to apply
+everywhere, or override it per project in **Workspace** settings — VSCode
+resolves the value with the usual Workspace-over-User precedence, and the
+extension picks it up automatically on the next launch.
+
+## Try it — example app
+
+[`examples/electron-app/`](examples/electron-app/) is a minimal Electron app
+wired with a `.devlauncher/config.json`. Open that folder as a workspace
+(locally or over Remote-SSH), then launch the **Example Electron App** target
+from the status bar to verify your setup end to end.
+
 ## Requirements
 
 Local machine: only what your target commands need (`node`, `pnpm`, …). Syncing

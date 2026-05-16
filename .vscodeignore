@@ -1,8 +1,10 @@
 .configs/**
 src/**
+examples/**
 node_modules/**
 **/*.map
 **/tsconfig.json
 .gitignore
 .vscodeignore
 pnpm-lock.yaml
+remote-dev-launcher.vsix

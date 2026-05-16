@@ -204,9 +204,28 @@ async function handleTrigger(uri: vscode.Uri): Promise<void> {
 	await launchTarget(data.target);
 }
 
+/**
+ * Base directory where remote workspaces are mirrored on the local machine.
+ *
+ * Read fresh from the `remoteDevLauncher.clonePath` setting on every call, so a
+ * change in VSCode's settings UI takes effect on the next launch with no reload.
+ * The workspace folder URI is passed so VSCode resolves the value with the
+ * normal precedence — Workspace settings override User/global settings.
+ */
+function cloneRoot(): string {
+	const setting = vscode.workspace
+		.getConfiguration("remoteDevLauncher", workspace?.folder.uri)
+		.get<string>("clonePath", "")
+		.trim();
+	if (!setting) return join(homedir(), ".devlauncher-mirrors");
+	if (setting === "~") return homedir();
+	if (setting.startsWith("~/") || setting.startsWith("~\\")) return join(homedir(), setting.slice(2));
+	return setting;
+}
+
 function mirrorDir(): string {
 	const name = config?.mirrorName?.trim() || basename(workspace?.repoPath ?? "") || "devmirror";
-	return join(homedir(), ".devlauncher-mirrors", name);
+	return join(cloneRoot(), name);
 }
 
 function isExcluded(segment: string): boolean {

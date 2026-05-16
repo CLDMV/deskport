@@ -39,7 +39,18 @@
 				"title": "Initialize Project",
 				"category": "Remote Dev Launcher"
 			}
-		]
+		],
+		"configuration": {
+			"title": "Remote Dev Launcher",
+			"properties": {
+				"remoteDevLauncher.clonePath": {
+					"type": "string",
+					"default": "",
+					"scope": "machine-overridable",
+					"markdownDescription": "Base directory on the **local machine** where remote workspaces are mirrored (cloned). Each project gets its own subfolder, named by the `mirrorName` in its `.devlauncher/config.json`.\n\nLeave empty to use the default `~/.devlauncher-mirrors`. A leading `~` expands to your home directory. Because this is a local filesystem path, it can be set globally in **User** settings or overridden per project in **Workspace** settings."
+				}
+			}
+		}
 	},
 	"scripts": {
 		"compile": "tsc -p .configs/tsconfig.json",

@@ -1,0 +1,12 @@
+{
+	"mirrorName": "deskport-example-electron",
+	"install": "pnpm install",
+	"excludes": ["node_modules", ".git"],
+	"targets": {
+		"app": {
+			"label": "Example Electron App",
+			"command": "pnpm dev",
+			"cwd": "."
+		}
+	}
+}

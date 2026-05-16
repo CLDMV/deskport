@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 # VSCode extension build output
 out/
 *.vsix
+
+# Remote Dev Launcher runtime trigger file
+**/.devlauncher/trigger.json
