@@ -46,7 +46,7 @@
 				"deskport.clonePath": {
 					"type": "string",
 					"default": "",
-					"scope": "machine-overridable",
+					"scope": "window",
 					"markdownDescription": "Base directory on the **local machine** where remote workspaces are mirrored (cloned). Each project gets its own subfolder, named by the `mirrorName` in its `.deskport/config.json`.\n\nLeave empty to use the default `~/.deskport-mirrors`. A leading `~` expands to your home directory. Because this is a local filesystem path, it can be set globally in **User** settings or overridden per project in **Workspace** settings."
 				}
 			}
