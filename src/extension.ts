@@ -1,5 +1,5 @@
 /**
- * Remote Dev Launcher — VSCode extension.
+ * DeskPort — VSCode extension.
  *
  * Declared `extensionKind: ["ui"]`, so VSCode runs it in the LOCAL extension
  * host even when the workspace is opened over Remote-SSH. That is the whole
@@ -13,7 +13,7 @@
  * The mirror is kept live by a `FileSystemWatcher`: each remote edit copies a
  * single file, so hot-reload is event-driven.
  *
- * Targets are defined per project in `.devlauncher/config.json`. Each target
+ * Targets are defined per project in `.deskport/config.json`. Each target
  * is a shell command run from a directory in the synced repo. A target can be
  * started from the status-bar menu, or from the REMOTE host by writing a
  * trigger file (resources/trigger.mjs) — which a remote `npm run` script can
@@ -29,8 +29,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 const DEFAULT_EXCLUDES = ["node_modules", ".git", "out", "dist", "release"];
-const CONFIG_REL = ".devlauncher/config.json";
-const TRIGGER_REL = ".devlauncher/trigger.json";
+const CONFIG_REL = ".deskport/config.json";
+const TRIGGER_REL = ".deskport/trigger.json";
 /** Skip a re-copy when local size matches and mtime is within this window. */
 const MTIME_TOLERANCE_MS = 2000;
 
@@ -44,7 +44,7 @@ interface TargetConfig {
 }
 
 interface LauncherConfig {
-	/** Subdirectory name under ~/.devlauncher-mirrors/; defaults to the repo folder name. */
+	/** Subdirectory name under ~/.deskport-mirrors/; defaults to the repo folder name. */
 	mirrorName?: string;
 	/** Command run once in the mirror after the first sync (e.g. "pnpm install"). */
 	install?: string;
@@ -75,9 +75,9 @@ const running = new Map<string, ChildProcess>();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	extensionUri = context.extensionUri;
-	output = vscode.window.createOutputChannel("Remote Dev Launcher");
+	output = vscode.window.createOutputChannel("DeskPort");
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-	statusItem.command = "remoteDevLauncher.menu";
+	statusItem.command = "deskport.menu";
 
 	workspace = resolveWorkspace();
 	await loadConfig();
@@ -87,8 +87,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(
 		output,
 		statusItem,
-		vscode.commands.registerCommand("remoteDevLauncher.menu", showMenu),
-		vscode.commands.registerCommand("remoteDevLauncher.init", initProject),
+		vscode.commands.registerCommand("deskport.menu", showMenu),
+		vscode.commands.registerCommand("deskport.init", initProject),
 		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
 			workspace = resolveWorkspace();
 			await loadConfig();
@@ -194,30 +194,30 @@ async function handleTrigger(uri: vscode.Uri): Promise<void> {
 		const bytes = await vscode.workspace.fs.readFile(uri);
 		data = JSON.parse(Buffer.from(bytes).toString("utf8")) as { target?: string; nonce?: number };
 	} catch (err) {
-		output.appendLine(`[devlauncher] ignored unreadable trigger: ${(err as Error).message}`);
+		output.appendLine(`[deskport] ignored unreadable trigger: ${(err as Error).message}`);
 		return;
 	}
 	if (!data.target) return;
 	if (typeof data.nonce === "number" && data.nonce === lastTriggerNonce) return;
 	lastTriggerNonce = typeof data.nonce === "number" ? data.nonce : undefined;
-	output.appendLine(`[devlauncher] remote trigger -> ${JSON.stringify(data.target)}`);
+	output.appendLine(`[deskport] remote trigger -> ${JSON.stringify(data.target)}`);
 	await launchTarget(data.target);
 }
 
 /**
  * Base directory where remote workspaces are mirrored on the local machine.
  *
- * Read fresh from the `remoteDevLauncher.clonePath` setting on every call, so a
+ * Read fresh from the `deskport.clonePath` setting on every call, so a
  * change in VSCode's settings UI takes effect on the next launch with no reload.
  * The workspace folder URI is passed so VSCode resolves the value with the
  * normal precedence — Workspace settings override User/global settings.
  */
 function cloneRoot(): string {
 	const setting = vscode.workspace
-		.getConfiguration("remoteDevLauncher", workspace?.folder.uri)
+		.getConfiguration("deskport", workspace?.folder.uri)
 		.get<string>("clonePath", "")
 		.trim();
-	if (!setting) return join(homedir(), ".devlauncher-mirrors");
+	if (!setting) return join(homedir(), ".deskport-mirrors");
 	if (setting === "~") return homedir();
 	if (setting.startsWith("~/") || setting.startsWith("~\\")) return join(homedir(), setting.slice(2));
 	return setting;
@@ -299,7 +299,7 @@ async function syncAll(ws: Workspace, mirror: string): Promise<void> {
 	const kept = new Set<string>();
 	const copied = await mirrorSubtree(ws.folder.uri, "", mirror, kept);
 	const removed = await pruneMirror(mirror, "", kept);
-	output.appendLine(`[devlauncher] mirror ready — ${copied} file(s) updated, ${removed} removed`);
+	output.appendLine(`[deskport] mirror ready — ${copied} file(s) updated, ${removed} removed`);
 }
 
 function ensureSyncWatcher(): void {
@@ -333,7 +333,7 @@ async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<
 			await mirrorFile(uri, localPath);
 		}
 	} catch (err) {
-		output.appendLine(`[devlauncher] sync skipped ${rel}: ${(err as Error).message}`);
+		output.appendLine(`[deskport] sync skipped ${rel}: ${(err as Error).message}`);
 	}
 }
 
@@ -341,7 +341,7 @@ function streamProcess(child: ChildProcess, name: string, resolve: (ok: boolean)
 	child.stdout?.on("data", (d: Buffer) => output.append(d.toString()));
 	child.stderr?.on("data", (d: Buffer) => output.append(d.toString()));
 	child.on("error", (err) => {
-		output.appendLine(`[devlauncher] ${name} failed to start: ${err.message}`);
+		output.appendLine(`[deskport] ${name} failed to start: ${err.message}`);
 		resolve(false);
 	});
 	child.on("exit", (code) => resolve(code === 0));
@@ -354,7 +354,7 @@ function runShell(commandLine: string, cwd: string): Promise<boolean> {
 async function launchTarget(name: string): Promise<void> {
 	if (!workspace) return error("open a workspace folder (local or over SSH) first.");
 	if (configError) return error(configError);
-	if (!config) return error(`no ${CONFIG_REL} — run "Remote Dev Launcher: Initialize Project".`);
+	if (!config) return error(`no ${CONFIG_REL} — run "DeskPort: Initialize Project".`);
 	if (busyText) return void info("the launcher is busy — try again in a moment.");
 
 	// Capture into locals so narrowing survives the `await`s below.
@@ -370,14 +370,14 @@ async function launchTarget(name: string): Promise<void> {
 
 	output.show(true);
 	output.appendLine("");
-	output.appendLine(`[devlauncher] launch ${JSON.stringify(name)}`);
+	output.appendLine(`[deskport] launch ${JSON.stringify(name)}`);
 
 	const cwdRel = target.cwd?.trim() || ".";
 	let runCwd: string;
 
 	if (ws.remote === null) {
 		runCwd = join(ws.repoPath, cwdRel);
-		output.appendLine(`[devlauncher] local repo: ${runCwd}`);
+		output.appendLine(`[deskport] local repo: ${runCwd}`);
 	} else {
 		const mirror = mirrorDir();
 		runCwd = join(mirror, cwdRel);
@@ -385,8 +385,8 @@ async function launchTarget(name: string): Promise<void> {
 		// the sync watcher keeps the mirror current, so skip straight to launch.
 		if (running.size === 0) {
 			await mkdir(mirror, { recursive: true });
-			output.appendLine(`[devlauncher] remote: ${ws.remote}:${ws.repoPath}`);
-			output.appendLine(`[devlauncher] mirror: ${mirror}`);
+			output.appendLine(`[deskport] remote: ${ws.remote}:${ws.repoPath}`);
+			output.appendLine(`[deskport] mirror: ${mirror}`);
 
 			setBusy("syncing");
 			try {
@@ -406,17 +406,17 @@ async function launchTarget(name: string): Promise<void> {
 	}
 
 	setBusy(`launching ${name}`);
-	output.appendLine(`[devlauncher] $ ${target.command}  (cwd: ${runCwd})`);
+	output.appendLine(`[deskport] $ ${target.command}  (cwd: ${runCwd})`);
 	const child = spawn(target.command, { cwd: runCwd, shell: true });
 	child.stdout?.on("data", (d: Buffer) => output.append(d.toString()));
 	child.stderr?.on("data", (d: Buffer) => output.append(d.toString()));
 	child.on("error", (err) => {
-		output.appendLine(`[devlauncher] ${JSON.stringify(name)} failed to start: ${err.message}`);
+		output.appendLine(`[deskport] ${JSON.stringify(name)} failed to start: ${err.message}`);
 		running.delete(name);
 		onRunningChange();
 	});
 	child.on("exit", (code) => {
-		output.appendLine(`[devlauncher] ${JSON.stringify(name)} exited (code ${code ?? 0})`);
+		output.appendLine(`[deskport] ${JSON.stringify(name)} exited (code ${code ?? 0})`);
 		running.delete(name);
 		onRunningChange();
 	});
@@ -429,7 +429,7 @@ async function launchTarget(name: string): Promise<void> {
 function stopTarget(name: string): void {
 	const child = running.get(name);
 	if (!child) return;
-	output.appendLine(`[devlauncher] stopping ${JSON.stringify(name)}`);
+	output.appendLine(`[deskport] stopping ${JSON.stringify(name)}`);
 	child.kill();
 }
 
@@ -447,8 +447,8 @@ async function showMenu(): Promise<void> {
 	if (!workspace) return error("open a workspace folder (local or over SSH) first.");
 	if (configError) return error(configError);
 	if (!config) {
-		const pick = await vscode.window.showQuickPick(["Initialize .devlauncher/ in this project"], {
-			placeHolder: "Remote Dev Launcher is not set up for this project",
+		const pick = await vscode.window.showQuickPick(["Initialize .deskport/ in this project"], {
+			placeHolder: "DeskPort is not set up for this project",
 		});
 		if (pick) await initProject();
 		return;
@@ -469,7 +469,7 @@ async function showMenu(): Promise<void> {
 		};
 	});
 	const chosen = await vscode.window.showQuickPick(items, {
-		placeHolder: "Remote Dev Launcher — select a target",
+		placeHolder: "DeskPort — select a target",
 	});
 	if (!chosen) return;
 	if (chosen.isRunning) stopTarget(chosen.target);
@@ -481,7 +481,7 @@ async function initProject(): Promise<void> {
 
 	const written: string[] = [];
 	written.push(...(await copyResourceIfMissing("config.template.json", CONFIG_REL)));
-	written.push(...(await copyResourceIfMissing("trigger.mjs", ".devlauncher/trigger.mjs")));
+	written.push(...(await copyResourceIfMissing("trigger.mjs", ".deskport/trigger.mjs")));
 
 	await loadConfig();
 	updateStatus();
@@ -490,10 +490,10 @@ async function initProject(): Promise<void> {
 	if (written.length > 0) {
 		info(
 			`wrote ${written.join(", ")}. Edit ${CONFIG_REL} to define your targets, ` +
-				`then add ".devlauncher/trigger.json" to .gitignore.`
+				`then add ".deskport/trigger.json" to .gitignore.`
 		);
 	} else {
-		info(".devlauncher/ is already initialized for this project.");
+		info(".deskport/ is already initialized for this project.");
 	}
 }
 
@@ -524,24 +524,24 @@ function clearBusy(): void {
 
 function updateStatus(): void {
 	if (busyText) {
-		statusItem.text = `$(sync~spin) Dev Launcher: ${busyText}`;
+		statusItem.text = `$(sync~spin) DeskPort: ${busyText}`;
 		statusItem.tooltip = busyText;
 	} else if (running.size > 0) {
-		statusItem.text = `$(debug-stop) Dev Launcher (${running.size})`;
+		statusItem.text = `$(debug-stop) DeskPort (${running.size})`;
 		statusItem.tooltip = `${running.size} target(s) running locally — click to manage`;
 	} else {
-		statusItem.text = "$(rocket) Dev Launch";
+		statusItem.text = "$(rocket) DeskPort";
 		statusItem.tooltip = config
 			? "Click to launch a dev target on this machine"
-			: (configError ?? "No .devlauncher/config.json — click to initialize");
+			: (configError ?? "No .deskport/config.json — click to initialize");
 	}
 }
 
 function error(message: string): void {
-	if (output) output.appendLine(`[devlauncher] ${message}`);
-	void vscode.window.showErrorMessage(`Remote Dev Launcher: ${message}`);
+	if (output) output.appendLine(`[deskport] ${message}`);
+	void vscode.window.showErrorMessage(`DeskPort: ${message}`);
 }
 
 function info(message: string): void {
-	void vscode.window.showInformationMessage(`Remote Dev Launcher: ${message}`);
+	void vscode.window.showInformationMessage(`DeskPort: ${message}`);
 }

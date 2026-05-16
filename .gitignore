@@ -146,5 +146,5 @@ vite.config.ts.timestamp-*
 out/
 *.vsix
 
-# Remote Dev Launcher runtime trigger file
-**/.devlauncher/trigger.json
+# DeskPort runtime trigger file
+**/.deskport/trigger.json

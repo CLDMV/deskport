@@ -1,6 +1,6 @@
 {
-	"name": "remote-dev-launcher",
-	"displayName": "Remote Dev Launcher",
+	"name": "deskport",
+	"displayName": "DeskPort",
 	"description": "Sync an SSH-remote workspace to your local machine and launch configured dev targets — for Electron and other GUI apps that must run where the display is.",
 	"version": "0.2.0",
 	"publisher": "cldmv",
@@ -30,32 +30,32 @@
 	"contributes": {
 		"commands": [
 			{
-				"command": "remoteDevLauncher.menu",
+				"command": "deskport.menu",
 				"title": "Targets…",
-				"category": "Remote Dev Launcher"
+				"category": "DeskPort"
 			},
 			{
-				"command": "remoteDevLauncher.init",
+				"command": "deskport.init",
 				"title": "Initialize Project",
-				"category": "Remote Dev Launcher"
+				"category": "DeskPort"
 			}
 		],
 		"configuration": {
-			"title": "Remote Dev Launcher",
+			"title": "DeskPort",
 			"properties": {
-				"remoteDevLauncher.clonePath": {
+				"deskport.clonePath": {
 					"type": "string",
 					"default": "",
 					"scope": "machine-overridable",
-					"markdownDescription": "Base directory on the **local machine** where remote workspaces are mirrored (cloned). Each project gets its own subfolder, named by the `mirrorName` in its `.devlauncher/config.json`.\n\nLeave empty to use the default `~/.devlauncher-mirrors`. A leading `~` expands to your home directory. Because this is a local filesystem path, it can be set globally in **User** settings or overridden per project in **Workspace** settings."
+					"markdownDescription": "Base directory on the **local machine** where remote workspaces are mirrored (cloned). Each project gets its own subfolder, named by the `mirrorName` in its `.deskport/config.json`.\n\nLeave empty to use the default `~/.deskport-mirrors`. A leading `~` expands to your home directory. Because this is a local filesystem path, it can be set globally in **User** settings or overridden per project in **Workspace** settings."
 				}
 			}
 		}
 	},
 	"scripts": {
 		"compile": "tsc -p .configs/tsconfig.json",
-		"package": "pnpm run compile && vsce package --no-dependencies -o remote-dev-launcher.vsix",
-		"install-local": "pnpm run package && code --install-extension remote-dev-launcher.vsix --force",
+		"package": "pnpm run compile && vsce package --no-dependencies -o deskport.vsix",
+		"install-local": "pnpm run package && code --install-extension deskport.vsix --force",
 		"publish": "pnpm run compile && vsce publish --no-dependencies"
 	},
 	"devDependencies": {

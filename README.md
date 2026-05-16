@@ -1,4 +1,4 @@
-# Remote Dev Launcher
+# DeskPort
 
 A VSCode extension that **launches dev targets on your local machine** even when
 the repo lives on a remote SSH host. Built for Electron and other GUI apps that
@@ -20,22 +20,26 @@ file, so hot-reload is event-driven.
 
 ## Install (once, per local machine)
 
-Build the `.vsix` (this can run on the remote — it is just a compile + zip):
+Build the `.vsix` from the repo root (this can run on the remote — it is just
+a compile + zip):
 
 ```bash
-cd tools/vscode-extension
-pnpm install --ignore-workspace
-pnpm run package          # produces remote-dev-launcher.vsix
+pnpm install
+pnpm run package          # produces deskport.vsix
 ```
 
 Then in VSCode: Command Palette → **Extensions: Install from VSIX…** → pick
-`remote-dev-launcher.vsix`. Because the extension is `ui`-kind, VSCode installs
-it on your local machine, so it serves every project you open.
+`deskport.vsix`. Because the extension is `ui`-kind, VSCode installs it on your
+local machine, so it serves every project you open.
+
+On your local machine you can do both steps at once with
+`pnpm run install-local`, which builds the `.vsix` and installs it via the
+`code` CLI.
 
 ## Set up a project
 
-Run **Remote Dev Launcher: Initialize Project** from the Command Palette. It
-writes two files under `.devlauncher/`:
+Run **DeskPort: Initialize Project** from the Command Palette. It
+writes two files under `.deskport/`:
 
 - `config.json` — defines your targets. Edit it:
 
@@ -53,15 +57,15 @@ writes two files under `.devlauncher/`:
 
   Each target is a shell `command` run from `cwd` (relative to the repo root).
   `install` runs once after the first sync. `mirrorName` is the local mirror
-  folder under `~/.devlauncher-mirrors/`.
+  folder under `~/.deskport-mirrors/`.
 
 - `trigger.mjs` — lets the remote start a target (see below).
 
-Add `.devlauncher/trigger.json` to your `.gitignore` — it is runtime state.
+Add `.deskport/trigger.json` to your `.gitignore` — it is runtime state.
 
 ## Launch a target
 
-**From the status bar** — click **🚀 Dev Launch** and pick a target. Running
+**From the status bar** — click **🚀 DeskPort** and pick a target. Running
 targets show a stop icon; pick one to stop it. Multiple targets run at once.
 
 **From the remote** — `trigger.mjs` writes a trigger file the extension watches
@@ -70,8 +74,8 @@ package scripts:
 
 ```json
 "scripts": {
-	"launchLocal1": "node .devlauncher/trigger.mjs app",
-	"launchLocal2": "node .devlauncher/trigger.mjs admin"
+	"launchLocal1": "node .deskport/trigger.mjs app",
+	"launchLocal2": "node .deskport/trigger.mjs admin"
 }
 ```
 
@@ -82,11 +86,11 @@ copies each remote edit so it hot-reloads.
 ## Settings
 
 The extension reads its settings from VSCode itself — there is no separate UI.
-Open **Settings** and search for "Remote Dev Launcher":
+Open **Settings** and search for "DeskPort":
 
-- **`remoteDevLauncher.clonePath`** — base directory on the **local machine**
+- **`deskport.clonePath`** — base directory on the **local machine**
   where remote workspaces are mirrored. Each project gets a subfolder named by
-  its `mirrorName`. Empty (the default) means `~/.devlauncher-mirrors`; a
+  its `mirrorName`. Empty (the default) means `~/.deskport-mirrors`; a
   leading `~` expands to your home directory.
 
 Because it is a local path, set it once in **User** settings to apply
@@ -97,7 +101,7 @@ extension picks it up automatically on the next launch.
 ## Try it — example app
 
 [`examples/electron-app/`](examples/electron-app/) is a minimal Electron app
-wired with a `.devlauncher/config.json`. Open that folder as a workspace
+wired with a `.deskport/config.json`. Open that folder as a workspace
 (locally or over Remote-SSH), then launch the **Example Electron App** target
 from the status bar to verify your setup end to end.
 

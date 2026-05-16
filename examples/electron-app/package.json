@@ -2,7 +2,7 @@
 	"name": "deskport-example-electron",
 	"version": "0.1.0",
 	"private": true,
-	"description": "Minimal Electron app used to test the Remote Dev Launcher extension.",
+	"description": "Minimal Electron app used to test the DeskPort extension.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "electron ."
