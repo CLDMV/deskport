@@ -13,11 +13,12 @@
  * The mirror is kept live by a `FileSystemWatcher`: each remote edit copies a
  * single file, so hot-reload is event-driven.
  *
- * Targets are defined per project in `.deskport/config.json`. Each target
- * is a shell command run from a directory in the synced repo. A target can be
- * started from the status-bar menu, or from the REMOTE host by writing a
- * trigger file (resources/trigger.mjs) — which a remote `npm run` script can
- * do, giving a "remote command -> local launch" flow.
+ * Targets come from one or more `.deskport/config.json` files: one at the
+ * workspace root and/or one per package in a monorepo. Each config owns the
+ * folder its `.deskport/` sits in, and a target's `cwd` is relative to that
+ * folder. A target can be started from the status-bar menu, or from the REMOTE
+ * host by writing a trigger file (resources/trigger.mjs) — giving a "remote
+ * command -> local launch" flow.
  *
  * Local requirements: only what a target command itself needs (node, pnpm, …).
  */
@@ -30,7 +31,7 @@ import { basename, dirname, join } from "node:path";
 
 const DEFAULT_EXCLUDES = ["node_modules", ".git", "out", "dist", "release"];
 const CONFIG_REL = ".deskport/config.json";
-const TRIGGER_REL = ".deskport/trigger.json";
+const TRIGGER_MJS_REL = ".deskport/trigger.mjs";
 /** Skip a re-copy when local size matches and mtime is within this window. */
 const MTIME_TOLERANCE_MS = 2000;
 
@@ -39,18 +40,37 @@ interface TargetConfig {
 	command: string;
 	/** Display name; defaults to the target key. */
 	label?: string;
-	/** Directory to run from, relative to the repo root; defaults to ".". */
+	/** Directory to run from, relative to this config's folder; defaults to ".". */
 	cwd?: string;
 }
 
 interface LauncherConfig {
-	/** Subdirectory name under ~/.deskport-mirrors/; defaults to the repo folder name. */
+	/** Subdirectory name under the clone path. Honored only in the ROOT config. */
 	mirrorName?: string;
-	/** Command run once in the mirror after the first sync (e.g. "pnpm install"). */
+	/** Command run once, in this config's folder, before its first target launches. */
 	install?: string;
-	/** Path segments to skip when mirroring (plain names or `*` globs). */
+	/** Path segments to skip when mirroring. Honored only in the ROOT config. */
 	excludes?: string[];
 	targets: Record<string, TargetConfig>;
+}
+
+/** One discovered `.deskport/config.json` and the package folder it owns. */
+interface DiscoveredConfig {
+	/** Workspace-relative folder owning this config; "" for the workspace root. */
+	packageRel: string;
+	config: LauncherConfig;
+}
+
+/** A single target flattened out of its owning config, with a unique id. */
+interface ResolvedTarget {
+	/** Unique across the workspace: `<packageRel>/<key>`, or `<key>` at the root. */
+	id: string;
+	/** Target key within its own config. */
+	key: string;
+	/** Folder owning the config ("" for the workspace root). */
+	packageRel: string;
+	pkg: DiscoveredConfig;
+	target: TargetConfig;
 }
 
 interface Workspace {
@@ -65,12 +85,16 @@ let extensionUri: vscode.Uri;
 let output: vscode.OutputChannel;
 let statusItem: vscode.StatusBarItem;
 let workspace: Workspace | undefined;
-let config: LauncherConfig | undefined;
-let configError: string | undefined;
+let configs: DiscoveredConfig[] = [];
+let configErrors: string[] = [];
 let busyText: string | undefined;
 let lastTriggerNonce: number | undefined;
 let watchers: vscode.Disposable[] = [];
 let syncWatcher: vscode.FileSystemWatcher | undefined;
+/** Whether the whole repo has been mirrored in the current launch session. */
+let mirrorSynced = false;
+/** packageRel values whose `install` command has run this session. */
+const installedPackages = new Set<string>();
 const running = new Map<string, ChildProcess>();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -80,7 +104,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	statusItem.command = "deskport.menu";
 
 	workspace = resolveWorkspace();
-	await loadConfig();
+	await loadConfigs();
 	updateStatus();
 	statusItem.show();
 
@@ -91,7 +115,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("deskport.init", initProject),
 		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
 			workspace = resolveWorkspace();
-			await loadConfig();
+			await loadConfigs();
 			registerWatchers();
 			updateStatus();
 		}),
@@ -138,29 +162,70 @@ function decodeHost(raw: string): string {
 	return raw;
 }
 
-async function loadConfig(): Promise<void> {
-	config = undefined;
-	configError = undefined;
+/** Discover every `.deskport/config.json` in the workspace (root and nested). */
+async function loadConfigs(): Promise<void> {
+	configs = [];
+	configErrors = [];
 	if (!workspace) return;
 
-	const uri = vscode.Uri.joinPath(workspace.folder.uri, CONFIG_REL);
-	let bytes: Uint8Array;
-	try {
-		bytes = await vscode.workspace.fs.readFile(uri);
-	} catch {
-		// No config file — the project just is not initialized yet. Not an error.
-		return;
-	}
-	try {
-		const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as LauncherConfig;
-		if (!parsed.targets || typeof parsed.targets !== "object" || Object.keys(parsed.targets).length === 0) {
-			configError = `${CONFIG_REL} defines no "targets".`;
-			return;
+	const found = await vscode.workspace.findFiles(
+		new vscode.RelativePattern(workspace.folder, "**/.deskport/config.json"),
+		"**/node_modules/**"
+	);
+	for (const uri of found) {
+		// rel looks like "packages/foo/.deskport/config.json" — drop the last
+		// two segments (".deskport/config.json") to get the package folder.
+		const rel = vscode.workspace.asRelativePath(uri, false);
+		const packageRel = rel.split("/").slice(0, -2).join("/");
+
+		let bytes: Uint8Array;
+		try {
+			bytes = await vscode.workspace.fs.readFile(uri);
+		} catch {
+			continue;
 		}
-		config = parsed;
-	} catch (err) {
-		configError = `${CONFIG_REL} is not valid JSON: ${(err as Error).message}`;
+		try {
+			const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as LauncherConfig;
+			if (!parsed.targets || typeof parsed.targets !== "object" || Object.keys(parsed.targets).length === 0) {
+				configErrors.push(`${rel} defines no "targets".`);
+				continue;
+			}
+			configs.push({ packageRel, config: parsed });
+		} catch (err) {
+			configErrors.push(`${rel} is not valid JSON: ${(err as Error).message}`);
+		}
 	}
+	// Root config first, then nested ones in path order — a stable menu order.
+	configs.sort((a, b) => a.packageRel.localeCompare(b.packageRel));
+}
+
+/** The workspace-root config, if one exists — it owns mirrorName and excludes. */
+function rootConfig(): LauncherConfig | undefined {
+	return configs.find((c) => c.packageRel === "")?.config;
+}
+
+/** Unique target id; the package folder disambiguates colliding target keys. */
+function targetId(packageRel: string, key: string): string {
+	return packageRel ? `${packageRel}/${key}` : key;
+}
+
+function allTargets(): ResolvedTarget[] {
+	const out: ResolvedTarget[] = [];
+	for (const pkg of configs) {
+		for (const [key, target] of Object.entries(pkg.config.targets)) {
+			out.push({ id: targetId(pkg.packageRel, key), key, packageRel: pkg.packageRel, pkg, target });
+		}
+	}
+	return out;
+}
+
+function findTarget(id: string): ResolvedTarget | undefined {
+	return allTargets().find((t) => t.id === id);
+}
+
+/** Join two workspace-relative paths, dropping empty and "." segments. */
+function joinRel(a: string, b: string): string {
+	return [...a.split("/"), ...b.split("/")].filter((s) => s && s !== ".").join("/");
 }
 
 function registerWatchers(): void {
@@ -169,16 +234,16 @@ function registerWatchers(): void {
 	if (!workspace) return;
 
 	const triggerWatcher = vscode.workspace.createFileSystemWatcher(
-		new vscode.RelativePattern(workspace.folder, TRIGGER_REL)
+		new vscode.RelativePattern(workspace.folder, "**/.deskport/trigger.json")
 	);
 	triggerWatcher.onDidChange(handleTrigger);
 	triggerWatcher.onDidCreate(handleTrigger);
 
 	const configWatcher = vscode.workspace.createFileSystemWatcher(
-		new vscode.RelativePattern(workspace.folder, CONFIG_REL)
+		new vscode.RelativePattern(workspace.folder, "**/.deskport/config.json")
 	);
 	const reload = async (): Promise<void> => {
-		await loadConfig();
+		await loadConfigs();
 		updateStatus();
 	};
 	configWatcher.onDidChange(reload);
@@ -200,8 +265,13 @@ async function handleTrigger(uri: vscode.Uri): Promise<void> {
 	if (!data.target) return;
 	if (typeof data.nonce === "number" && data.nonce === lastTriggerNonce) return;
 	lastTriggerNonce = typeof data.nonce === "number" ? data.nonce : undefined;
-	output.appendLine(`[deskport] remote trigger -> ${JSON.stringify(data.target)}`);
-	await launchTarget(data.target);
+
+	// The trigger file lives in its package's `.deskport/`, so the target name
+	// resolves within that same package.
+	const packageRel = vscode.workspace.asRelativePath(uri, false).split("/").slice(0, -2).join("/");
+	const id = targetId(packageRel, data.target);
+	output.appendLine(`[deskport] remote trigger -> ${JSON.stringify(id)}`);
+	await launchTarget(id);
 }
 
 /**
@@ -224,12 +294,12 @@ function cloneRoot(): string {
 }
 
 function mirrorDir(): string {
-	const name = config?.mirrorName?.trim() || basename(workspace?.repoPath ?? "") || "devmirror";
+	const name = rootConfig()?.mirrorName?.trim() || basename(workspace?.repoPath ?? "") || "devmirror";
 	return join(cloneRoot(), name);
 }
 
 function isExcluded(segment: string): boolean {
-	for (const pattern of config?.excludes ?? DEFAULT_EXCLUDES) {
+	for (const pattern of rootConfig()?.excludes ?? DEFAULT_EXCLUDES) {
 		if (pattern.includes("*")) {
 			const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
 			if (re.test(segment)) return true;
@@ -351,39 +421,38 @@ function runShell(commandLine: string, cwd: string): Promise<boolean> {
 	return new Promise((resolve) => streamProcess(spawn(commandLine, { cwd, shell: true }), commandLine, resolve));
 }
 
-async function launchTarget(name: string): Promise<void> {
+async function launchTarget(id: string): Promise<void> {
 	if (!workspace) return error("open a workspace folder (local or over SSH) first.");
-	if (configError) return error(configError);
-	if (!config) return error(`no ${CONFIG_REL} — run "DeskPort: Initialize Project".`);
-	if (busyText) return void info("the launcher is busy — try again in a moment.");
+	if (busyText) return void info("DeskPort is busy — try again in a moment.");
 
-	// Capture into locals so narrowing survives the `await`s below.
+	// Capture into a local so narrowing survives the `await`s below.
 	const ws = workspace;
-	const cfg = config;
 
-	const target = cfg.targets[name];
-	if (!target) return error(`no target ${JSON.stringify(name)} in ${CONFIG_REL}.`);
-	if (running.has(name)) {
+	const rt = findTarget(id);
+	if (!rt) return error(`no target ${JSON.stringify(id)} found in any ${CONFIG_REL}.`);
+	if (running.has(id)) {
 		output.show(true);
-		return void info(`target ${JSON.stringify(name)} is already running.`);
+		return void info(`target ${JSON.stringify(rt.key)} is already running.`);
 	}
 
 	output.show(true);
 	output.appendLine("");
-	output.appendLine(`[deskport] launch ${JSON.stringify(name)}`);
+	output.appendLine(`[deskport] launch ${JSON.stringify(id)}`);
 
-	const cwdRel = target.cwd?.trim() || ".";
+	// Where the target runs: <base>/<package folder>/<target cwd>.
+	const relFromRoot = joinRel(rt.packageRel, rt.target.cwd?.trim() || ".");
 	let runCwd: string;
 
 	if (ws.remote === null) {
-		runCwd = join(ws.repoPath, cwdRel);
+		runCwd = join(ws.repoPath, relFromRoot);
 		output.appendLine(`[deskport] local repo: ${runCwd}`);
 	} else {
 		const mirror = mirrorDir();
-		runCwd = join(mirror, cwdRel);
-		// Cold start: full sync + install. Warm (another target already running):
-		// the sync watcher keeps the mirror current, so skip straight to launch.
-		if (running.size === 0) {
+		runCwd = join(mirror, relFromRoot);
+
+		// Cold start: mirror the whole repo once per launch session. While any
+		// target runs, the sync watcher keeps the mirror current.
+		if (!mirrorSynced) {
 			await mkdir(mirror, { recursive: true });
 			output.appendLine(`[deskport] remote: ${ws.remote}:${ws.repoPath}`);
 			output.appendLine(`[deskport] mirror: ${mirror}`);
@@ -395,58 +464,73 @@ async function launchTarget(name: string): Promise<void> {
 				clearBusy();
 				return error(`initial sync failed: ${(err as Error).message}`);
 			}
-			if (cfg.install) {
-				setBusy("installing");
-				if (!(await runShell(cfg.install, mirror))) {
-					clearBusy();
-					return error(`install command failed: ${cfg.install}`);
-				}
+			mirrorSynced = true;
+		}
+
+		// Per-package install: run this config's `install` lazily, the first
+		// time one of its targets launches this session.
+		const installCmd = rt.pkg.config.install?.trim();
+		if (installCmd && !installedPackages.has(rt.packageRel)) {
+			const installCwd = join(mirror, rt.packageRel);
+			setBusy(`installing ${rt.packageRel || "."}`);
+			output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
+			if (!(await runShell(installCmd, installCwd))) {
+				clearBusy();
+				return error(`install command failed: ${installCmd}`);
 			}
+			installedPackages.add(rt.packageRel);
 		}
 	}
 
-	setBusy(`launching ${name}`);
-	output.appendLine(`[deskport] $ ${target.command}  (cwd: ${runCwd})`);
-	const child = spawn(target.command, { cwd: runCwd, shell: true });
+	setBusy(`launching ${rt.key}`);
+	output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${runCwd})`);
+	const child = spawn(rt.target.command, { cwd: runCwd, shell: true });
 	child.stdout?.on("data", (d: Buffer) => output.append(d.toString()));
 	child.stderr?.on("data", (d: Buffer) => output.append(d.toString()));
 	child.on("error", (err) => {
-		output.appendLine(`[deskport] ${JSON.stringify(name)} failed to start: ${err.message}`);
-		running.delete(name);
+		output.appendLine(`[deskport] ${JSON.stringify(id)} failed to start: ${err.message}`);
+		running.delete(id);
 		onRunningChange();
 	});
 	child.on("exit", (code) => {
-		output.appendLine(`[deskport] ${JSON.stringify(name)} exited (code ${code ?? 0})`);
-		running.delete(name);
+		output.appendLine(`[deskport] ${JSON.stringify(id)} exited (code ${code ?? 0})`);
+		running.delete(id);
 		onRunningChange();
 	});
 
-	running.set(name, child);
+	running.set(id, child);
 	ensureSyncWatcher();
 	clearBusy();
 }
 
-function stopTarget(name: string): void {
-	const child = running.get(name);
+function stopTarget(id: string): void {
+	const child = running.get(id);
 	if (!child) return;
-	output.appendLine(`[deskport] stopping ${JSON.stringify(name)}`);
+	output.appendLine(`[deskport] stopping ${JSON.stringify(id)}`);
 	child.kill();
 }
 
 function stopAll(): void {
-	for (const name of [...running.keys()]) stopTarget(name);
+	for (const id of [...running.keys()]) stopTarget(id);
 	stopSyncWatcher();
 }
 
 function onRunningChange(): void {
-	if (running.size === 0) stopSyncWatcher();
+	if (running.size === 0) {
+		// Session over: drop the live mirror, and re-sync/-install next time.
+		stopSyncWatcher();
+		mirrorSynced = false;
+		installedPackages.clear();
+	}
 	updateStatus();
 }
 
 async function showMenu(): Promise<void> {
 	if (!workspace) return error("open a workspace folder (local or over SSH) first.");
-	if (configError) return error(configError);
-	if (!config) {
+	for (const e of configErrors) output.appendLine(`[deskport] ${e}`);
+
+	if (configs.length === 0) {
+		if (configErrors.length > 0) return error(configErrors.join("; "));
 		const pick = await vscode.window.showQuickPick(["Initialize .deskport/ in this project"], {
 			placeHolder: "DeskPort is not set up for this project",
 		});
@@ -454,26 +538,28 @@ async function showMenu(): Promise<void> {
 		return;
 	}
 
-	interface Item extends vscode.QuickPickItem {
-		target: string;
-		isRunning: boolean;
+	type Item = vscode.QuickPickItem & { id?: string; isRunning?: boolean };
+	const items: Item[] = [];
+	for (const pkg of configs) {
+		items.push({ label: pkg.packageRel || "workspace root", kind: vscode.QuickPickItemKind.Separator });
+		for (const [key, t] of Object.entries(pkg.config.targets)) {
+			const id = targetId(pkg.packageRel, key);
+			const isRunning = running.has(id);
+			items.push({
+				label: `${isRunning ? "$(debug-stop)" : "$(rocket)"} ${t.label ?? key}`,
+				description: isRunning ? "running — select to stop" : "select to launch",
+				detail: t.command,
+				id,
+				isRunning,
+			});
+		}
 	}
-	const items: Item[] = Object.entries(config.targets).map(([name, t]) => {
-		const isRunning = running.has(name);
-		return {
-			label: `${isRunning ? "$(debug-stop)" : "$(rocket)"} ${t.label ?? name}`,
-			description: isRunning ? "running — select to stop" : "select to launch",
-			detail: t.command,
-			target: name,
-			isRunning,
-		};
-	});
 	const chosen = await vscode.window.showQuickPick(items, {
 		placeHolder: "DeskPort — select a target",
 	});
-	if (!chosen) return;
-	if (chosen.isRunning) stopTarget(chosen.target);
-	else await launchTarget(chosen.target);
+	if (!chosen?.id) return;
+	if (chosen.isRunning) stopTarget(chosen.id);
+	else await launchTarget(chosen.id);
 }
 
 async function initProject(): Promise<void> {
@@ -481,16 +567,17 @@ async function initProject(): Promise<void> {
 
 	const written: string[] = [];
 	written.push(...(await copyResourceIfMissing("config.template.json", CONFIG_REL)));
-	written.push(...(await copyResourceIfMissing("trigger.mjs", ".deskport/trigger.mjs")));
+	written.push(...(await copyResourceIfMissing("trigger.mjs", TRIGGER_MJS_REL)));
 
-	await loadConfig();
+	await loadConfigs();
 	updateStatus();
 	registerWatchers();
 
 	if (written.length > 0) {
 		info(
 			`wrote ${written.join(", ")}. Edit ${CONFIG_REL} to define your targets, ` +
-				`then add ".deskport/trigger.json" to .gitignore.`
+				`then add ".deskport/trigger.json" to .gitignore. For a monorepo, add a ` +
+				`.deskport/config.json in each package too.`
 		);
 	} else {
 		info(".deskport/ is already initialized for this project.");
@@ -531,9 +618,10 @@ function updateStatus(): void {
 		statusItem.tooltip = `${running.size} target(s) running locally — click to manage`;
 	} else {
 		statusItem.text = "$(rocket) DeskPort";
-		statusItem.tooltip = config
-			? "Click to launch a dev target on this machine"
-			: (configError ?? "No .deskport/config.json — click to initialize");
+		statusItem.tooltip =
+			configs.length > 0
+				? "Click to launch a dev target on this machine"
+				: (configErrors[0] ?? "No .deskport/config.json — click to initialize");
 	}
 }
 
