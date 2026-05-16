@@ -1,0 +1,8 @@
+.configs/**
+src/**
+node_modules/**
+**/*.map
+**/tsconfig.json
+.gitignore
+.vscodeignore
+pnpm-lock.yaml

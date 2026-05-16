@@ -1,0 +1,12 @@
+{
+	"mirrorName": "my-app",
+	"install": "pnpm install",
+	"excludes": ["node_modules", ".git", "out", "dist", "release"],
+	"targets": {
+		"app": {
+			"label": "My Electron App",
+			"command": "pnpm dev",
+			"cwd": "."
+		}
+	}
+}

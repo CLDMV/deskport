@@ -1,0 +1,46 @@
+{
+	"name": "remote-dev-launcher",
+	"displayName": "Remote Dev Launcher",
+	"description": "Sync an SSH-remote workspace to your local machine and launch configured dev targets — for Electron and other GUI apps that must run where the display is.",
+	"version": "0.2.0",
+	"publisher": "cldmv",
+	"private": true,
+	"license": "SEE LICENSE IN LICENSE",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"extensionKind": [
+		"ui"
+	],
+	"categories": [
+		"Other"
+	],
+	"main": "./out/extension.js",
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"contributes": {
+		"commands": [
+			{
+				"command": "remoteDevLauncher.menu",
+				"title": "Targets…",
+				"category": "Remote Dev Launcher"
+			},
+			{
+				"command": "remoteDevLauncher.init",
+				"title": "Initialize Project",
+				"category": "Remote Dev Launcher"
+			}
+		]
+	},
+	"scripts": {
+		"compile": "tsc -p .configs/tsconfig.json",
+		"package": "pnpm run compile && vsce package --no-dependencies --allow-missing-repository -o remote-dev-launcher.vsix"
+	},
+	"devDependencies": {
+		"@types/node": "^22.13.5",
+		"@types/vscode": "^1.85.0",
+		"@vscode/vsce": "^3.2.1",
+		"typescript": "^5.7.3"
+	}
+}
