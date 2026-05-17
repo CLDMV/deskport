@@ -1,5 +1,5 @@
 // Minimal Electron entry point — opens a single window for testing the
-// Remote Dev Launcher extension. No preload or IPC; the page is static.
+// DeskPort extension. No preload or IPC; the page is static.
 
 const { app, BrowserWindow } = require("electron");
 const path = require("node:path");
