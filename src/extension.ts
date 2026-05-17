@@ -97,6 +97,8 @@ interface TargetTerminal {
 	child?: ChildProcess;
 	/** A launch queued until the pseudoterminal's open() fires. */
 	pending?: { rt: ResolvedTarget; runCwd: string };
+	/** How the most recent run ended — drives the sidebar status. */
+	exit?: { code: number | null; signal: NodeJS.Signals | null };
 }
 
 let extensionUri: vscode.Uri;
@@ -118,7 +120,7 @@ const installedPackages = new Set<string>();
 const terminals = new Map<string, TargetTerminal>();
 
 /** A detail row shown under a target — icon, text, and an optional click action. */
-type DetailNode = { kind: "detail"; icon: string; text: string; action?: vscode.Command };
+type DetailNode = { kind: "detail"; icon: vscode.ThemeIcon; text: string; action?: vscode.Command };
 
 /**
  * A node in the DeskPort targets tree: a package group, a launchable target,
@@ -126,9 +128,44 @@ type DetailNode = { kind: "detail"; icon: string; text: string; action?: vscode.
  */
 type TreeNode = { kind: "package"; packageRel: string } | { kind: "target"; rt: ResolvedTarget } | DetailNode;
 
-/** The icon for a target's run state — shared by the target row and its detail. */
-function statusIcon(running: boolean): string {
-	return running ? "play-circle" : "circle-outline";
+/** The run state of a target, shown in the sidebar. */
+type TargetStatus = "idle" | "running" | "exited" | "failed" | "stopped";
+
+/** Derive a target's status from its terminal and most recent exit. */
+function targetStatus(id: string): TargetStatus {
+	const tt = terminals.get(id);
+	if (!tt) return "idle";
+	if (tt.child) return "running";
+	if (!tt.exit) return "idle";
+	if (tt.exit.code === 0) return "exited";
+	if (tt.exit.signal) return "stopped";
+	return "failed";
+}
+
+/** A themed status icon — shared by the target row and its status detail row. */
+function statusIcon(status: TargetStatus): vscode.ThemeIcon {
+	switch (status) {
+		case "running":
+			return new vscode.ThemeIcon("play-circle", new vscode.ThemeColor("charts.green"));
+		case "exited":
+			return new vscode.ThemeIcon("pass-filled", new vscode.ThemeColor("charts.green"));
+		case "failed":
+			return new vscode.ThemeIcon("error", new vscode.ThemeColor("list.errorForeground"));
+		case "stopped":
+			return new vscode.ThemeIcon("circle-slash", new vscode.ThemeColor("charts.yellow"));
+		default:
+			return new vscode.ThemeIcon("circle-outline");
+	}
+}
+
+/** A target's status as text — `failed` carries its exit code. */
+function statusLabel(id: string): string {
+	const status = targetStatus(id);
+	if (status === "failed") {
+		const code = terminals.get(id)?.exit?.code;
+		return code != null ? `failed (exit ${code})` : "failed";
+	}
+	return status;
 }
 
 /** Resolve a package's targets into tree nodes. */
@@ -141,12 +178,14 @@ function targetsIn(pkg: DiscoveredConfig): TreeNode[] {
 
 /** The detail rows shown when a target is expanded; each row is clickable. */
 function detailsOf(rt: ResolvedTarget): DetailNode[] {
-	const running = terminals.get(rt.id)?.child !== undefined;
-
 	// Command — opens the .deskport/config.json that defines this target.
-	const command: DetailNode = { kind: "detail", icon: "terminal", text: rt.target.command };
+	const command: DetailNode = { kind: "detail", icon: new vscode.ThemeIcon("terminal"), text: rt.target.command };
 	// Folder — reveals the package folder in the Explorer.
-	const folder: DetailNode = { kind: "detail", icon: "folder", text: rt.packageRel || "workspace root" };
+	const folder: DetailNode = {
+		kind: "detail",
+		icon: new vscode.ThemeIcon("folder"),
+		text: rt.packageRel || "workspace root",
+	};
 	if (workspace) {
 		const configRel = rt.packageRel ? `${rt.packageRel}/${CONFIG_REL}` : CONFIG_REL;
 		command.action = {
@@ -163,14 +202,16 @@ function detailsOf(rt: ResolvedTarget): DetailNode[] {
 	// Status — opens (focusing or creating) the target's terminal.
 	const status: DetailNode = {
 		kind: "detail",
-		icon: statusIcon(running),
-		text: running ? "running" : "idle",
+		icon: statusIcon(targetStatus(rt.id)),
+		text: statusLabel(rt.id),
 		action: { command: "deskport.openTerminal", title: "Open the terminal", arguments: [rt.id] },
 	};
 
 	const rows: DetailNode[] = [command, folder, status];
 	const cwd = rt.target.cwd?.trim();
-	if (cwd && cwd !== ".") rows.push({ kind: "detail", icon: "folder-opened", text: `cwd: ${cwd}` });
+	if (cwd && cwd !== ".") {
+		rows.push({ kind: "detail", icon: new vscode.ThemeIcon("folder-opened"), text: `cwd: ${cwd}` });
+	}
 	return rows;
 }
 
@@ -221,7 +262,7 @@ class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
 		}
 		if (node.kind === "detail") {
 			const item = new vscode.TreeItem(node.text, vscode.TreeItemCollapsibleState.None);
-			item.iconPath = new vscode.ThemeIcon(node.icon);
+			item.iconPath = node.icon;
 			if (node.action) {
 				item.command = node.action;
 				item.tooltip = node.action.title;
@@ -231,12 +272,12 @@ class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
 		// A target — collapsible so selecting it reveals details. No `command`,
 		// so a click only expands/selects; the inline rocket button launches it.
 		const { rt } = node;
-		const running = terminals.get(rt.id)?.child !== undefined;
+		const status = targetStatus(rt.id);
 		const item = new vscode.TreeItem(rt.target.label ?? rt.key, vscode.TreeItemCollapsibleState.Collapsed);
-		item.description = running ? "running" : "";
+		item.description = status === "idle" ? "" : statusLabel(rt.id);
 		item.tooltip = rt.target.command;
-		item.iconPath = new vscode.ThemeIcon(statusIcon(running));
-		item.contextValue = running ? "deskport.target.running" : "deskport.target.idle";
+		item.iconPath = statusIcon(status);
+		item.contextValue = status === "running" ? "deskport.target.running" : "deskport.target.idle";
 		return item;
 	}
 }
@@ -586,6 +627,19 @@ async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<
 }
 
 /**
+ * The environment for a spawned target. VSCode runs its extension host as a
+ * Node-mode Electron process, so `process.env` carries `ELECTRON_RUN_AS_NODE`.
+ * If that leaks into a child Electron app, the app boots as plain Node and
+ * `require("electron")` yields no `app`. Strip it. FORCE_COLOR keeps the
+ * child's output colored without a real TTY.
+ */
+function childEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: "1" };
+	delete env.ELECTRON_RUN_AS_NODE;
+	return env;
+}
+
+/**
  * Run a shell command, streaming its output to the channel while keeping a
  * bounded tail of it. Resolves with whether it succeeded and that tail, so a
  * caller can surface the failure detail.
@@ -593,7 +647,7 @@ async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<
 function runShell(commandLine: string, cwd: string): Promise<{ ok: boolean; tail: string }> {
 	return new Promise((resolve) => {
 		let tail = "";
-		const child = spawn(commandLine, { cwd, shell: true });
+		const child = spawn(commandLine, { cwd, shell: true, env: childEnv() });
 		const capture = (d: Buffer): void => {
 			const text = d.toString();
 			output.append(text);
@@ -749,19 +803,25 @@ function startProcess(tt: TargetTerminal, rt: ResolvedTarget, cwd: string): void
 	output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${cwd})`);
 	tt.writer.fire(`\r\n\x1b[36m$ ${rt.target.command}\x1b[0m\r\n`);
 
-	const child = spawn(rt.target.command, { cwd, shell: true, env: { ...process.env, FORCE_COLOR: "1" } });
+	const child = spawn(rt.target.command, { cwd, shell: true, env: childEnv() });
 	tt.child = child;
 	const stream = (d: Buffer): void => tt.writer.fire(d.toString().replace(/\r?\n/g, "\r\n"));
 	child.stdout?.on("data", stream);
 	child.stderr?.on("data", stream);
 	child.on("error", (err) => {
 		tt.writer.fire(`\r\n\x1b[31m[deskport] failed to start: ${err.message}\x1b[0m\r\n`);
-		if (tt.child === child) tt.child = undefined;
+		if (tt.child === child) {
+			tt.child = undefined;
+			tt.exit = { code: null, signal: null }; // no code + no signal -> "failed"
+		}
 		onActiveChange();
 	});
 	child.on("exit", (code, signal) => {
 		tt.writer.fire(`\r\n\x1b[90m[deskport] exited (code ${code ?? 0}${signal ? `, ${signal}` : ""})\x1b[0m\r\n`);
-		if (tt.child === child) tt.child = undefined;
+		if (tt.child === child) {
+			tt.child = undefined;
+			tt.exit = { code, signal };
+		}
 		onActiveChange();
 	});
 
