@@ -43,11 +43,18 @@ Copilot Chat's anchored status bar popup uses `window.createChatStatusItem()`
 `chatStatusItem` in `enabledApiProposals` and calls `createChatStatusItem` in
 its code.
 
-`chatStatusItem` is a **proposed API**. Proposed APIs are gated to builtin /
-allowlisted extensions; `vsce publish` rejects a package that declares
-`enabledApiProposals`, so a published Marketplace extension cannot use it.
-DeskPort therefore uses a trusted `MarkdownString` `tooltip` (a hover card
-above the status bar item) as the closest stable-API equivalent.
+`chatStatusItem` is a **proposed API**. Packaging is NOT the blocker —
+`vsce package` builds a `.vsix` with `enabledApiProposals` just fine (tested).
+The blocker is **runtime**: VSCode only grants a proposed API to builtin or
+allowlisted extensions, or when VSCode is launched with
+`--enable-proposed-api <publisher.ext>`. A normally-installed third-party
+extension never gets it — `window.createChatStatusItem` is simply `undefined`.
+Proposed APIs also change between VSCode releases without notice.
 
-**Revisit** if `chatStatusItem` is ever finalized into stable API and
-generalized beyond chat.
+So DeskPort can't rely on it for regular users; it uses a trusted
+`MarkdownString` `tooltip` (a hover card above the status bar item) instead.
+A private/personal build could use it by launching VSCode with
+`--enable-proposed-api cldmv.deskport`, accepting the per-machine flag and the
+churn.
+
+**Revisit** if `chatStatusItem` is ever finalized into stable API.
