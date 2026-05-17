@@ -117,14 +117,19 @@ const installedPackages = new Set<string>();
 /** Open terminals, keyed by target id — one per target, reused across launches. */
 const terminals = new Map<string, TargetTerminal>();
 
+/** A detail row shown under a target — icon, text, and an optional click action. */
+type DetailNode = { kind: "detail"; icon: string; text: string; action?: vscode.Command };
+
 /**
  * A node in the DeskPort targets tree: a package group, a launchable target,
  * or a detail row shown when a target is expanded.
  */
-type TreeNode =
-	| { kind: "package"; packageRel: string }
-	| { kind: "target"; rt: ResolvedTarget }
-	| { kind: "detail"; icon: string; text: string };
+type TreeNode = { kind: "package"; packageRel: string } | { kind: "target"; rt: ResolvedTarget } | DetailNode;
+
+/** The icon for a target's run state — shared by the target row and its detail. */
+function statusIcon(running: boolean): string {
+	return running ? "play-circle" : "circle-outline";
+}
 
 /** Resolve a package's targets into tree nodes. */
 function targetsIn(pkg: DiscoveredConfig): TreeNode[] {
@@ -134,16 +139,38 @@ function targetsIn(pkg: DiscoveredConfig): TreeNode[] {
 	}));
 }
 
-/** The detail rows shown when a target is expanded. */
-function detailsOf(rt: ResolvedTarget): TreeNode[] {
+/** The detail rows shown when a target is expanded; each row is clickable. */
+function detailsOf(rt: ResolvedTarget): DetailNode[] {
 	const running = terminals.get(rt.id)?.child !== undefined;
-	const rows: TreeNode[] = [
-		{ kind: "detail", icon: "terminal", text: rt.target.command },
-		{ kind: "detail", icon: "folder", text: rt.packageRel || "workspace root" },
-		{ kind: "detail", icon: running ? "debug-start" : "circle-outline", text: running ? "running" : "idle" },
-	];
+
+	// Command — opens the .deskport/config.json that defines this target.
+	const command: DetailNode = { kind: "detail", icon: "terminal", text: rt.target.command };
+	// Folder — reveals the package folder in the Explorer.
+	const folder: DetailNode = { kind: "detail", icon: "folder", text: rt.packageRel || "workspace root" };
+	if (workspace) {
+		const configRel = rt.packageRel ? `${rt.packageRel}/${CONFIG_REL}` : CONFIG_REL;
+		command.action = {
+			command: "vscode.open",
+			title: "Open the .deskport/config.json",
+			arguments: [vscode.Uri.joinPath(workspace.folder.uri, configRel)],
+		};
+		folder.action = {
+			command: "revealInExplorer",
+			title: "Reveal the folder in Explorer",
+			arguments: [rt.packageRel ? vscode.Uri.joinPath(workspace.folder.uri, rt.packageRel) : workspace.folder.uri],
+		};
+	}
+	// Status — opens (focusing or creating) the target's terminal.
+	const status: DetailNode = {
+		kind: "detail",
+		icon: statusIcon(running),
+		text: running ? "running" : "idle",
+		action: { command: "deskport.openTerminal", title: "Open the terminal", arguments: [rt.id] },
+	};
+
+	const rows: DetailNode[] = [command, folder, status];
 	const cwd = rt.target.cwd?.trim();
-	if (cwd && cwd !== ".") rows.push({ kind: "detail", icon: "file-directory", text: `cwd: ${cwd}` });
+	if (cwd && cwd !== ".") rows.push({ kind: "detail", icon: "folder-opened", text: `cwd: ${cwd}` });
 	return rows;
 }
 
@@ -195,6 +222,10 @@ class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
 		if (node.kind === "detail") {
 			const item = new vscode.TreeItem(node.text, vscode.TreeItemCollapsibleState.None);
 			item.iconPath = new vscode.ThemeIcon(node.icon);
+			if (node.action) {
+				item.command = node.action;
+				item.tooltip = node.action.title;
+			}
 			return item;
 		}
 		// A target — collapsible so selecting it reveals details. No `command`,
@@ -204,7 +235,7 @@ class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
 		const item = new vscode.TreeItem(rt.target.label ?? rt.key, vscode.TreeItemCollapsibleState.Collapsed);
 		item.description = running ? "running" : "";
 		item.tooltip = rt.target.command;
-		item.iconPath = new vscode.ThemeIcon(running ? "circle-filled" : "circle-outline");
+		item.iconPath = new vscode.ThemeIcon(statusIcon(running));
 		item.contextValue = running ? "deskport.target.running" : "deskport.target.idle";
 		return item;
 	}
@@ -232,6 +263,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("deskport.init", initProject),
 		vscode.commands.registerCommand("deskport.launch", (arg: unknown) => launchTarget(asTargetId(arg))),
 		vscode.commands.registerCommand("deskport.stop", (arg: unknown) => stopTarget(asTargetId(arg))),
+		vscode.commands.registerCommand("deskport.openTerminal", (id: string) => openTerminal(id)),
 		vscode.window.registerTreeDataProvider("deskport.targets", targetsProvider),
 		vscode.window.onDidCloseTerminal(forgetClosedTerminal),
 		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
@@ -691,8 +723,24 @@ function createTargetTerminal(id: string): TargetTerminal {
 			if (data === "\u0003") tt.child?.kill("SIGINT"); // Ctrl+C
 		},
 	};
-	tt.terminal = vscode.window.createTerminal({ name: `DeskPort: ${id}`, pty });
+	tt.terminal = vscode.window.createTerminal({
+		name: `DeskPort: ${id}`,
+		pty,
+		iconPath: new vscode.ThemeIcon("rocket"),
+	});
 	return tt;
+}
+
+/** Focus a target's terminal, creating an idle one (no process) if none exists. */
+function openTerminal(id: string): void {
+	let tt = terminals.get(id);
+	if (!tt) {
+		if (!findTarget(id)) return;
+		tt = createTargetTerminal(id);
+		terminals.set(id, tt);
+		updateStatus();
+	}
+	tt.terminal.show();
 }
 
 /** Spawn a target's process locally and stream it into its terminal. */
