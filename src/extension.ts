@@ -103,10 +103,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusItem.command = "deskport.menu";
 
+	// Show the status bar item immediately, from the synchronous part of
+	// activation — so a slow or failing config scan can never leave DeskPort
+	// invisible. Config discovery happens afterwards and refreshes the item.
 	workspace = resolveWorkspace();
-	await loadConfigs();
 	updateStatus();
 	statusItem.show();
+	output.appendLine("[deskport] extension activated");
 
 	context.subscriptions.push(
 		output,
@@ -123,6 +126,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		{ dispose: stopSyncWatcher }
 	);
 	registerWatchers();
+
+	try {
+		await loadConfigs();
+	} catch (err) {
+		output.appendLine(`[deskport] config scan failed: ${(err as Error).message}`);
+	}
+	updateStatus();
 }
 
 export function deactivate(): void {
@@ -162,41 +172,59 @@ function decodeHost(raw: string): string {
 	return raw;
 }
 
-/** Discover every `.deskport/config.json` in the workspace (root and nested). */
+/**
+ * Discover every `.deskport/config.json` in the workspace (root and nested).
+ *
+ * Walks the tree with `vscode.workspace.fs` — the same filesystem bridge the
+ * sync feature uses — rather than `findFiles`, so it works reliably when a
+ * `ui`-kind extension scans a Remote-SSH workspace.
+ */
 async function loadConfigs(): Promise<void> {
 	configs = [];
 	configErrors = [];
 	if (!workspace) return;
-
-	const found = await vscode.workspace.findFiles(
-		new vscode.RelativePattern(workspace.folder, "**/.deskport/config.json"),
-		"**/node_modules/**"
-	);
-	for (const uri of found) {
-		// rel looks like "packages/foo/.deskport/config.json" — drop the last
-		// two segments (".deskport/config.json") to get the package folder.
-		const rel = vscode.workspace.asRelativePath(uri, false);
-		const packageRel = rel.split("/").slice(0, -2).join("/");
-
-		let bytes: Uint8Array;
-		try {
-			bytes = await vscode.workspace.fs.readFile(uri);
-		} catch {
-			continue;
-		}
-		try {
-			const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as LauncherConfig;
-			if (!parsed.targets || typeof parsed.targets !== "object" || Object.keys(parsed.targets).length === 0) {
-				configErrors.push(`${rel} defines no "targets".`);
-				continue;
-			}
-			configs.push({ packageRel, config: parsed });
-		} catch (err) {
-			configErrors.push(`${rel} is not valid JSON: ${(err as Error).message}`);
-		}
-	}
+	await discoverConfigs(workspace.folder.uri, "");
 	// Root config first, then nested ones in path order — a stable menu order.
 	configs.sort((a, b) => a.packageRel.localeCompare(b.packageRel));
+}
+
+/** Recursively look for `.deskport/` folders, skipping excluded directories. */
+async function discoverConfigs(dir: vscode.Uri, rel: string): Promise<void> {
+	let entries: [string, vscode.FileType][];
+	try {
+		entries = await vscode.workspace.fs.readDirectory(dir);
+	} catch {
+		return;
+	}
+	for (const [name, type] of entries) {
+		if (!(type & vscode.FileType.Directory) || isExcluded(name)) continue;
+		if (name === ".deskport") {
+			await readConfigFile(vscode.Uri.joinPath(dir, name, "config.json"), rel);
+		} else {
+			await discoverConfigs(vscode.Uri.joinPath(dir, name), rel ? `${rel}/${name}` : name);
+		}
+	}
+}
+
+/** Parse one `.deskport/config.json`, recording it or its error. */
+async function readConfigFile(uri: vscode.Uri, packageRel: string): Promise<void> {
+	let bytes: Uint8Array;
+	try {
+		bytes = await vscode.workspace.fs.readFile(uri);
+	} catch {
+		return; // a `.deskport/` folder without a config.json — not an error
+	}
+	const label = `${packageRel ? packageRel + "/" : ""}.deskport/config.json`;
+	try {
+		const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as LauncherConfig;
+		if (!parsed.targets || typeof parsed.targets !== "object" || Object.keys(parsed.targets).length === 0) {
+			configErrors.push(`${label} defines no "targets".`);
+			return;
+		}
+		configs.push({ packageRel, config: parsed });
+	} catch (err) {
+		configErrors.push(`${label} is not valid JSON: ${(err as Error).message}`);
+	}
 }
 
 /** The workspace-root config, if one exists — it owns mirrorName and excludes. */
