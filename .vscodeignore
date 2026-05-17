@@ -1,3 +1,4 @@
+# Source & tooling — never shipped
 .configs/**
 src/**
 examples/**
@@ -8,3 +9,8 @@ node_modules/**
 .vscodeignore
 pnpm-lock.yaml
 deskport.vsix
+
+# out/: ship only compiled JavaScript. Exclude everything, then allow *.js
+# back in — so a stray file dropped in out/ can never leak into the package.
+out/**
+!out/**/*.js
