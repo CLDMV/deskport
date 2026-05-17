@@ -2,7 +2,7 @@
 	"name": "deskport",
 	"displayName": "DeskPort",
 	"description": "Sync an SSH-remote workspace to your local machine and launch configured dev targets — for Electron and other GUI apps that must run where the display is.",
-	"version": "0.6.0",
+	"version": "0.6.1",
 	"publisher": "cldmv",
 	"icon": "resources/logo.png",
 	"license": "SEE LICENSE IN LICENSE",
@@ -53,11 +53,11 @@
 			}
 		],
 		"viewsContainers": {
-			"panel": [
+			"activitybar": [
 				{
 					"id": "deskport",
 					"title": "DeskPort",
-					"icon": "resources/logo.png"
+					"icon": "resources/panel-icon.svg"
 				}
 			]
 		},

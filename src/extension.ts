@@ -117,8 +117,14 @@ const installedPackages = new Set<string>();
 /** Open terminals, keyed by target id — one per target, reused across launches. */
 const terminals = new Map<string, TargetTerminal>();
 
-/** A node in the DeskPort targets tree: a package group, or a launchable target. */
-type TreeNode = { kind: "package"; packageRel: string } | { kind: "target"; rt: ResolvedTarget };
+/**
+ * A node in the DeskPort targets tree: a package group, a launchable target,
+ * or a detail row shown when a target is expanded.
+ */
+type TreeNode =
+	| { kind: "package"; packageRel: string }
+	| { kind: "target"; rt: ResolvedTarget }
+	| { kind: "detail"; icon: string; text: string };
 
 /** Resolve a package's targets into tree nodes. */
 function targetsIn(pkg: DiscoveredConfig): TreeNode[] {
@@ -126,6 +132,19 @@ function targetsIn(pkg: DiscoveredConfig): TreeNode[] {
 		kind: "target",
 		rt: { id: targetId(pkg.packageRel, key), key, packageRel: pkg.packageRel, pkg, target },
 	}));
+}
+
+/** The detail rows shown when a target is expanded. */
+function detailsOf(rt: ResolvedTarget): TreeNode[] {
+	const running = terminals.get(rt.id)?.child !== undefined;
+	const rows: TreeNode[] = [
+		{ kind: "detail", icon: "terminal", text: rt.target.command },
+		{ kind: "detail", icon: "folder", text: rt.packageRel || "workspace root" },
+		{ kind: "detail", icon: running ? "debug-start" : "circle-outline", text: running ? "running" : "idle" },
+	];
+	const cwd = rt.target.cwd?.trim();
+	if (cwd && cwd !== ".") rows.push({ kind: "detail", icon: "file-directory", text: `cwd: ${cwd}` });
+	return rows;
 }
 
 /** A `deskport.launch`/`stop` argument: a target id (string) or a tree node. */
@@ -137,7 +156,7 @@ function asTargetId(arg: unknown): string {
 	return "";
 }
 
-/** Backs the "Targets" panel — a tree of targets, grouped by package. */
+/** Backs the "Targets" view — a tree of targets, grouped by package. */
 class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
 	private readonly emitter = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this.emitter.event;
@@ -158,6 +177,8 @@ class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
 			const pkg = configs.find((c) => c.packageRel === node.packageRel);
 			return pkg ? targetsIn(pkg) : [];
 		}
+		// Expanding a target reveals its detail rows.
+		if (node.kind === "target") return detailsOf(node.rt);
 		return [];
 	}
 
@@ -171,14 +192,20 @@ class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
 			item.contextValue = "deskport.package";
 			return item;
 		}
+		if (node.kind === "detail") {
+			const item = new vscode.TreeItem(node.text, vscode.TreeItemCollapsibleState.None);
+			item.iconPath = new vscode.ThemeIcon(node.icon);
+			return item;
+		}
+		// A target — collapsible so selecting it reveals details. No `command`,
+		// so a click only expands/selects; the inline rocket button launches it.
 		const { rt } = node;
 		const running = terminals.get(rt.id)?.child !== undefined;
-		const item = new vscode.TreeItem(rt.target.label ?? rt.key, vscode.TreeItemCollapsibleState.None);
-		item.description = rt.target.command;
-		item.tooltip = running ? `${rt.target.command} — running` : rt.target.command;
-		item.iconPath = new vscode.ThemeIcon(running ? "debug-stop" : "rocket");
+		const item = new vscode.TreeItem(rt.target.label ?? rt.key, vscode.TreeItemCollapsibleState.Collapsed);
+		item.description = running ? "running" : "";
+		item.tooltip = rt.target.command;
+		item.iconPath = new vscode.ThemeIcon(running ? "circle-filled" : "circle-outline");
 		item.contextValue = running ? "deskport.target.running" : "deskport.target.idle";
-		item.command = { command: "deskport.launch", title: "Launch", arguments: [rt.id] };
 		return item;
 	}
 }
