@@ -34,6 +34,8 @@ const CONFIG_REL = ".deskport/config.json";
 const TRIGGER_MJS_REL = ".deskport/trigger.mjs";
 /** Skip a re-copy when local size matches and mtime is within this window. */
 const MTIME_TOLERANCE_MS = 2000;
+/** Max characters of a process's output kept for error reporting. */
+const OUTPUT_TAIL_LIMIT = 4000;
 
 interface TargetConfig {
 	/** Shell command to run (from the synced repo). */
@@ -437,25 +439,41 @@ async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<
 	}
 }
 
-function streamProcess(child: ChildProcess, name: string, resolve: (ok: boolean) => void): void {
-	child.stdout?.on("data", (d: Buffer) => output.append(d.toString()));
-	child.stderr?.on("data", (d: Buffer) => output.append(d.toString()));
-	child.on("error", (err) => {
-		output.appendLine(`[deskport] ${name} failed to start: ${err.message}`);
-		resolve(false);
+/**
+ * Run a shell command, streaming its output to the channel while keeping a
+ * bounded tail of it. Resolves with whether it succeeded and that tail, so a
+ * caller can surface the failure detail.
+ */
+function runShell(commandLine: string, cwd: string): Promise<{ ok: boolean; tail: string }> {
+	return new Promise((resolve) => {
+		let tail = "";
+		const child = spawn(commandLine, { cwd, shell: true });
+		const capture = (d: Buffer): void => {
+			const text = d.toString();
+			output.append(text);
+			tail = (tail + text).slice(-OUTPUT_TAIL_LIMIT);
+		};
+		child.stdout?.on("data", capture);
+		child.stderr?.on("data", capture);
+		child.on("error", (err) => {
+			output.appendLine(`[deskport] ${commandLine} failed to start: ${err.message}`);
+			resolve({ ok: false, tail: err.message });
+		});
+		child.on("exit", (code) => resolve({ ok: code === 0, tail: tail.trim() }));
 	});
-	child.on("exit", (code) => resolve(code === 0));
 }
 
-function runShell(commandLine: string, cwd: string): Promise<boolean> {
-	return new Promise((resolve) => streamProcess(spawn(commandLine, { cwd, shell: true }), commandLine, resolve));
-}
-
-/** Report a launch failure: log it, reveal the output, show an error toast. */
-function failLaunch(message: string): void {
+/**
+ * Report a launch failure: log it, reveal the output channel, and show an
+ * error notification. `detail` (e.g. the target's own error output) is
+ * appended after a blank line, so it shows when the toast is expanded.
+ */
+function failLaunch(summary: string, detail?: string): void {
 	clearBusy();
+	output.appendLine(`[deskport] ${summary}`);
 	output.show(true);
-	error(message);
+	const trimmed = detail?.trim();
+	void vscode.window.showErrorMessage(`DeskPort: ${trimmed ? `${summary}\n\n${trimmed}` : summary}`);
 }
 
 async function launchTarget(id: string): Promise<void> {
@@ -515,9 +533,8 @@ async function launchTarget(id: string): Promise<void> {
 					progress.report({ message: `installing dependencies — ${installCmd}` });
 					setBusy(`installing ${rt.packageRel || "."}`);
 					output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
-					if (!(await runShell(installCmd, join(mirror, rt.packageRel)))) {
-						return failLaunch(`install failed: ${installCmd}`);
-					}
+					const install = await runShell(installCmd, join(mirror, rt.packageRel));
+					if (!install.ok) return failLaunch(`install failed: ${installCmd}`, install.tail);
 					installedPackages.add(rt.packageRel);
 				}
 			}
@@ -526,13 +543,20 @@ async function launchTarget(id: string): Promise<void> {
 			setBusy(`launching ${rt.key}`);
 			output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${runCwd})`);
 			const child = spawn(rt.target.command, { cwd: runCwd, shell: true });
-			child.stdout?.on("data", (d: Buffer) => output.append(d.toString()));
-			child.stderr?.on("data", (d: Buffer) => output.append(d.toString()));
+			// Keep a bounded tail of the target's output so a crash can report it.
+			let outputTail = "";
+			const capture = (d: Buffer): void => {
+				const text = d.toString();
+				output.append(text);
+				outputTail = (outputTail + text).slice(-OUTPUT_TAIL_LIMIT);
+			};
+			child.stdout?.on("data", capture);
+			child.stderr?.on("data", capture);
 			child.on("error", (err) => {
 				output.appendLine(`[deskport] ${JSON.stringify(id)} failed to start: ${err.message}`);
 				running.delete(id);
 				onRunningChange();
-				failLaunch(`target ${JSON.stringify(rt.key)} failed to start: ${err.message}`);
+				failLaunch(`target ${JSON.stringify(rt.key)} failed to start.`, err.message);
 			});
 			child.on("exit", (code, signal) => {
 				output.appendLine(
@@ -542,7 +566,9 @@ async function launchTarget(id: string): Promise<void> {
 				const crashed = code !== 0 && code !== null;
 				running.delete(id);
 				onRunningChange();
-				if (crashed) failLaunch(`target ${JSON.stringify(rt.key)} exited with code ${code}.`);
+				if (crashed) {
+					failLaunch(`target ${JSON.stringify(rt.key)} exited with code ${code}.`, outputTail);
+				}
 			});
 
 			running.set(id, child);
