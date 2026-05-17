@@ -116,6 +116,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		statusItem,
 		vscode.commands.registerCommand("deskport.menu", showMenu),
 		vscode.commands.registerCommand("deskport.init", initProject),
+		vscode.commands.registerCommand("deskport.launch", (id: string) => launchTarget(id)),
+		vscode.commands.registerCommand("deskport.stop", (id: string) => stopTarget(id)),
 		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
 			workspace = resolveWorkspace();
 			await loadConfigs();
@@ -449,6 +451,13 @@ function runShell(commandLine: string, cwd: string): Promise<boolean> {
 	return new Promise((resolve) => streamProcess(spawn(commandLine, { cwd, shell: true }), commandLine, resolve));
 }
 
+/** Report a launch failure: log it, reveal the output, show an error toast. */
+function failLaunch(message: string): void {
+	clearBusy();
+	output.show(true);
+	error(message);
+}
+
 async function launchTarget(id: string): Promise<void> {
 	if (!workspace) return error("open a workspace folder (local or over SSH) first.");
 	if (busyText) return void info("DeskPort is busy — try again in a moment.");
@@ -469,66 +478,78 @@ async function launchTarget(id: string): Promise<void> {
 
 	// Where the target runs: <base>/<package folder>/<target cwd>.
 	const relFromRoot = joinRel(rt.packageRel, rt.target.cwd?.trim() || ".");
-	let runCwd: string;
 
-	if (ws.remote === null) {
-		runCwd = join(ws.repoPath, relFromRoot);
-		output.appendLine(`[deskport] local repo: ${runCwd}`);
-	} else {
-		const mirror = mirrorDir();
-		runCwd = join(mirror, relFromRoot);
+	// Sync, install and spawn run inside a progress notification so the launch
+	// is visible. The notification closes once the process is spawned; a
+	// failure after that surfaces as its own error notification (see below).
+	await vscode.window.withProgress(
+		{ location: vscode.ProgressLocation.Notification, title: `DeskPort: launching ${rt.key}`, cancellable: false },
+		async (progress): Promise<void> => {
+			let runCwd: string;
 
-		// Cold start: mirror the whole repo once per launch session. While any
-		// target runs, the sync watcher keeps the mirror current.
-		if (!mirrorSynced) {
-			await mkdir(mirror, { recursive: true });
-			output.appendLine(`[deskport] remote: ${ws.remote}:${ws.repoPath}`);
-			output.appendLine(`[deskport] mirror: ${mirror}`);
+			if (ws.remote === null) {
+				runCwd = join(ws.repoPath, relFromRoot);
+				output.appendLine(`[deskport] local repo: ${runCwd}`);
+			} else {
+				const mirror = mirrorDir();
+				runCwd = join(mirror, relFromRoot);
 
-			setBusy("syncing");
-			try {
-				await syncAll(ws, mirror);
-			} catch (err) {
-				clearBusy();
-				return error(`initial sync failed: ${(err as Error).message}`);
+				// Cold start: mirror the whole repo once per launch session.
+				if (!mirrorSynced) {
+					output.appendLine(`[deskport] remote: ${ws.remote}:${ws.repoPath}`);
+					output.appendLine(`[deskport] mirror: ${mirror}`);
+					progress.report({ message: "syncing repo to this machine…" });
+					setBusy("syncing");
+					try {
+						await mkdir(mirror, { recursive: true });
+						await syncAll(ws, mirror);
+					} catch (err) {
+						return failLaunch(`initial sync failed: ${(err as Error).message}`);
+					}
+					mirrorSynced = true;
+				}
+
+				// Per-package install, lazily on this package's first launch.
+				const installCmd = rt.pkg.config.install?.trim();
+				if (installCmd && !installedPackages.has(rt.packageRel)) {
+					progress.report({ message: `installing dependencies — ${installCmd}` });
+					setBusy(`installing ${rt.packageRel || "."}`);
+					output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
+					if (!(await runShell(installCmd, join(mirror, rt.packageRel)))) {
+						return failLaunch(`install failed: ${installCmd}`);
+					}
+					installedPackages.add(rt.packageRel);
+				}
 			}
-			mirrorSynced = true;
+
+			progress.report({ message: `starting — ${rt.target.command}` });
+			setBusy(`launching ${rt.key}`);
+			output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${runCwd})`);
+			const child = spawn(rt.target.command, { cwd: runCwd, shell: true });
+			child.stdout?.on("data", (d: Buffer) => output.append(d.toString()));
+			child.stderr?.on("data", (d: Buffer) => output.append(d.toString()));
+			child.on("error", (err) => {
+				output.appendLine(`[deskport] ${JSON.stringify(id)} failed to start: ${err.message}`);
+				running.delete(id);
+				onRunningChange();
+				failLaunch(`target ${JSON.stringify(rt.key)} failed to start: ${err.message}`);
+			});
+			child.on("exit", (code, signal) => {
+				output.appendLine(
+					`[deskport] ${JSON.stringify(id)} exited (code ${code ?? 0}${signal ? `, ${signal}` : ""})`
+				);
+				// A non-zero code is a crash; null means we killed it (a Stop).
+				const crashed = code !== 0 && code !== null;
+				running.delete(id);
+				onRunningChange();
+				if (crashed) failLaunch(`target ${JSON.stringify(rt.key)} exited with code ${code}.`);
+			});
+
+			running.set(id, child);
+			ensureSyncWatcher();
+			clearBusy();
 		}
-
-		// Per-package install: run this config's `install` lazily, the first
-		// time one of its targets launches this session.
-		const installCmd = rt.pkg.config.install?.trim();
-		if (installCmd && !installedPackages.has(rt.packageRel)) {
-			const installCwd = join(mirror, rt.packageRel);
-			setBusy(`installing ${rt.packageRel || "."}`);
-			output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
-			if (!(await runShell(installCmd, installCwd))) {
-				clearBusy();
-				return error(`install command failed: ${installCmd}`);
-			}
-			installedPackages.add(rt.packageRel);
-		}
-	}
-
-	setBusy(`launching ${rt.key}`);
-	output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${runCwd})`);
-	const child = spawn(rt.target.command, { cwd: runCwd, shell: true });
-	child.stdout?.on("data", (d: Buffer) => output.append(d.toString()));
-	child.stderr?.on("data", (d: Buffer) => output.append(d.toString()));
-	child.on("error", (err) => {
-		output.appendLine(`[deskport] ${JSON.stringify(id)} failed to start: ${err.message}`);
-		running.delete(id);
-		onRunningChange();
-	});
-	child.on("exit", (code) => {
-		output.appendLine(`[deskport] ${JSON.stringify(id)} exited (code ${code ?? 0})`);
-		running.delete(id);
-		onRunningChange();
-	});
-
-	running.set(id, child);
-	ensureSyncWatcher();
-	clearBusy();
+	);
 }
 
 function stopTarget(id: string): void {
@@ -637,20 +658,66 @@ function clearBusy(): void {
 	updateStatus();
 }
 
+/** The `command:` URI a Markdown link uses to invoke an extension command. */
+function commandUri(command: string, arg?: string): string {
+	const query = arg === undefined ? "" : `?${encodeURIComponent(JSON.stringify([arg]))}`;
+	return `command:${command}${query}`;
+}
+
+/**
+ * The status bar item's tooltip — a trusted MarkdownString shown as a hover
+ * card above the item. It lists every target as a clickable link grouped by
+ * package; clicking one runs deskport.launch / deskport.stop directly, so the
+ * hover doubles as the launch menu (no top-of-window QuickPick needed).
+ */
+function buildTooltip(): vscode.MarkdownString {
+	const md = new vscode.MarkdownString(undefined, true);
+	md.isTrusted = { enabledCommands: ["deskport.launch", "deskport.stop", "deskport.init"] };
+
+	if (busyText) {
+		md.appendMarkdown(`$(sync~spin) **DeskPort** — ${busyText}…`);
+		return md;
+	}
+	if (configs.length === 0) {
+		if (configErrors.length > 0) {
+			md.appendMarkdown(configErrors.map((e) => `$(error) ${e}`).join("\n\n"));
+		} else {
+			md.appendMarkdown("**DeskPort**\n\n");
+			md.appendMarkdown(`[$(add) Initialize .deskport/ in this project](${commandUri("deskport.init")})`);
+		}
+		return md;
+	}
+
+	md.appendMarkdown("**DeskPort** — launch a dev target on this machine");
+	for (const pkg of configs) {
+		md.appendMarkdown(`\n\n**${pkg.packageRel || "workspace root"}**\n\n`);
+		const lines: string[] = [];
+		for (const [key, t] of Object.entries(pkg.config.targets)) {
+			const id = targetId(pkg.packageRel, key);
+			const label = t.label ?? key;
+			lines.push(
+				running.has(id)
+					? `$(debug-stop) [Stop “${label}”](${commandUri("deskport.stop", id)})`
+					: `$(rocket) [${label}](${commandUri("deskport.launch", id)})`
+			);
+		}
+		md.appendMarkdown(lines.join("\n\n"));
+	}
+	if (configErrors.length > 0) {
+		md.appendMarkdown(`\n\n${configErrors.map((e) => `$(warning) ${e}`).join("\n\n")}`);
+	}
+	return md;
+}
+
 function updateStatus(): void {
 	if (busyText) {
 		statusItem.text = `$(sync~spin) DeskPort: ${busyText}`;
-		statusItem.tooltip = busyText;
 	} else if (running.size > 0) {
 		statusItem.text = `$(debug-stop) DeskPort (${running.size})`;
-		statusItem.tooltip = `${running.size} target(s) running locally — click to manage`;
 	} else {
 		statusItem.text = "$(rocket) DeskPort";
-		statusItem.tooltip =
-			configs.length > 0
-				? "Click to launch a dev target on this machine"
-				: (configErrors[0] ?? "No .deskport/config.json — click to initialize");
 	}
+	statusItem.tooltip = buildTooltip();
 }
 
 function error(message: string): void {
