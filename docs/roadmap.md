@@ -35,3 +35,19 @@ keeping the program's output visible.
 - Richer status updates per target (starting / running / exited / crashed)
 - Per-target run history and a restart action
 - A dockable DeskPort view (tree of targets with inline run/stop)
+
+## Status bar hover/click popup
+
+Copilot Chat's anchored status bar popup uses `window.createChatStatusItem()`
+— confirmed by inspecting the builtin `GitHub.copilot-chat` extension: it lists
+`chatStatusItem` in `enabledApiProposals` and calls `createChatStatusItem` in
+its code.
+
+`chatStatusItem` is a **proposed API**. Proposed APIs are gated to builtin /
+allowlisted extensions; `vsce publish` rejects a package that declares
+`enabledApiProposals`, so a published Marketplace extension cannot use it.
+DeskPort therefore uses a trusted `MarkdownString` `tooltip` (a hover card
+above the status bar item) as the closest stable-API equivalent.
+
+**Revisit** if `chatStatusItem` is ever finalized into stable API and
+generalized beyond chat.
