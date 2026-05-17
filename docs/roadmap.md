@@ -43,18 +43,20 @@ Copilot Chat's anchored status bar popup uses `window.createChatStatusItem()`
 `chatStatusItem` in `enabledApiProposals` and calls `createChatStatusItem` in
 its code.
 
-`chatStatusItem` is a **proposed API**. Packaging is NOT the blocker —
-`vsce package` builds a `.vsix` with `enabledApiProposals` just fine (tested).
-The blocker is **runtime**: VSCode only grants a proposed API to builtin or
-allowlisted extensions, or when VSCode is launched with
-`--enable-proposed-api <publisher.ext>`. A normally-installed third-party
-extension never gets it — `window.createChatStatusItem` is simply `undefined`.
-Proposed APIs also change between VSCode releases without notice.
+`chatStatusItem` is a **proposed API** — `vsce package` accepts it, but at
+runtime VSCode only grants proposed APIs to builtin / allowlisted extensions
+or when launched with `--enable-proposed-api <publisher.ext>`.
 
-So DeskPort can't rely on it for regular users; it uses a trusted
-`MarkdownString` `tooltip` (a hover card above the status bar item) instead.
-A private/personal build could use it by launching VSCode with
-`--enable-proposed-api cldmv.deskport`, accepting the per-machine flag and the
-churn.
+**Tested, then reverted (v0.5.0 → v0.5.1).** DeskPort shipped an experimental
+`createChatStatusItem` behind the proposed API. With the launch flag it *did*
+work — but every `createChatStatusItem` entry aggregates into the single
+**shared Chat status popup**, the same one Copilot uses. DeskPort appeared
+*inside Copilot's popup*, not in a popup of its own. So this API is not a path
+to a separate DeskPort popup, and it was removed.
 
-**Revisit** if `chatStatusItem` is ever finalized into stable API.
+Conclusion: a regular extension cannot produce a dedicated, pinnable status
+bar popup. DeskPort uses a trusted `MarkdownString` `tooltip` (a hover card
+above the status bar item). That tooltip cannot be pinned by a click —
+click-to-pin is a property of the core Chat status popup only.
+
+**Revisit** only if VSCode adds a stable, general status-bar popup API.
