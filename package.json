@@ -2,7 +2,7 @@
 	"name": "deskport",
 	"displayName": "DeskPort",
 	"description": "Sync an SSH-remote workspace to your local machine and launch configured dev targets — for Electron and other GUI apps that must run where the display is.",
-	"version": "0.5.1",
+	"version": "0.6.0",
 	"publisher": "cldmv",
 	"icon": "resources/logo.png",
 	"license": "SEE LICENSE IN LICENSE",
@@ -38,8 +38,62 @@
 				"command": "deskport.init",
 				"title": "Initialize Project",
 				"category": "DeskPort"
+			},
+			{
+				"command": "deskport.launch",
+				"title": "Launch Target",
+				"category": "DeskPort",
+				"icon": "$(rocket)"
+			},
+			{
+				"command": "deskport.stop",
+				"title": "Stop Target",
+				"category": "DeskPort",
+				"icon": "$(debug-stop)"
 			}
 		],
+		"viewsContainers": {
+			"panel": [
+				{
+					"id": "deskport",
+					"title": "DeskPort",
+					"icon": "resources/logo.png"
+				}
+			]
+		},
+		"views": {
+			"deskport": [
+				{
+					"id": "deskport.targets",
+					"name": "Targets",
+					"icon": "resources/logo.png"
+				}
+			]
+		},
+		"viewsWelcome": [
+			{
+				"view": "deskport.targets",
+				"contents": "No DeskPort targets were found in this workspace.\nAdd a .deskport/config.json to a package, or initialize this project.\n[Initialize Project](command:deskport.init)"
+			}
+		],
+		"menus": {
+			"commandPalette": [
+				{ "command": "deskport.launch", "when": "false" },
+				{ "command": "deskport.stop", "when": "false" }
+			],
+			"view/item/context": [
+				{
+					"command": "deskport.launch",
+					"when": "view == deskport.targets && viewItem == deskport.target.idle",
+					"group": "inline"
+				},
+				{
+					"command": "deskport.stop",
+					"when": "view == deskport.targets && viewItem == deskport.target.running",
+					"group": "inline"
+				}
+			]
+		},
 		"configuration": {
 			"title": "DeskPort",
 			"properties": {

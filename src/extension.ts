@@ -24,7 +24,7 @@
  */
 
 import * as vscode from "vscode";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readdir, rm, stat as statLocal, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -83,9 +83,26 @@ interface Workspace {
 	repoPath: string;
 }
 
+/**
+ * A target's terminal — a pseudoterminal DeskPort feeds from a process it
+ * spawns itself. The spawn happens in the (local) extension host, so the
+ * target runs on THIS machine even when the workspace is remote.
+ */
+interface TargetTerminal {
+	id: string;
+	terminal: vscode.Terminal;
+	/** Writes text to the terminal UI. */
+	writer: vscode.EventEmitter<string>;
+	/** The process currently running in it, if any. */
+	child?: ChildProcess;
+	/** A launch queued until the pseudoterminal's open() fires. */
+	pending?: { rt: ResolvedTarget; runCwd: string };
+}
+
 let extensionUri: vscode.Uri;
 let output: vscode.OutputChannel;
 let statusItem: vscode.StatusBarItem;
+let targetsProvider: TargetsProvider;
 let workspace: Workspace | undefined;
 let configs: DiscoveredConfig[] = [];
 let configErrors: string[] = [];
@@ -98,13 +115,80 @@ let mirrorSynced = false;
 /** packageRel values whose `install` command has run this session. */
 const installedPackages = new Set<string>();
 /** Open terminals, keyed by target id — one per target, reused across launches. */
-const terminals = new Map<string, vscode.Terminal>();
+const terminals = new Map<string, TargetTerminal>();
+
+/** A node in the DeskPort targets tree: a package group, or a launchable target. */
+type TreeNode = { kind: "package"; packageRel: string } | { kind: "target"; rt: ResolvedTarget };
+
+/** Resolve a package's targets into tree nodes. */
+function targetsIn(pkg: DiscoveredConfig): TreeNode[] {
+	return Object.entries(pkg.config.targets).map(([key, target]): TreeNode => ({
+		kind: "target",
+		rt: { id: targetId(pkg.packageRel, key), key, packageRel: pkg.packageRel, pkg, target },
+	}));
+}
+
+/** A `deskport.launch`/`stop` argument: a target id (string) or a tree node. */
+function asTargetId(arg: unknown): string {
+	if (typeof arg === "string") return arg;
+	if (arg && typeof arg === "object" && (arg as TreeNode).kind === "target") {
+		return (arg as { rt: ResolvedTarget }).rt.id;
+	}
+	return "";
+}
+
+/** Backs the "Targets" panel — a tree of targets, grouped by package. */
+class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
+	private readonly emitter = new vscode.EventEmitter<void>();
+	readonly onDidChangeTreeData = this.emitter.event;
+
+	/** Re-render the tree — called when configs or running state change. */
+	refresh(): void {
+		this.emitter.fire();
+	}
+
+	getChildren(node?: TreeNode): TreeNode[] {
+		if (!node) {
+			// A single config: list its targets directly; otherwise group by package.
+			const single = configs.length === 1 ? configs[0] : undefined;
+			if (single) return targetsIn(single);
+			return configs.map((c): TreeNode => ({ kind: "package", packageRel: c.packageRel }));
+		}
+		if (node.kind === "package") {
+			const pkg = configs.find((c) => c.packageRel === node.packageRel);
+			return pkg ? targetsIn(pkg) : [];
+		}
+		return [];
+	}
+
+	getTreeItem(node: TreeNode): vscode.TreeItem {
+		if (node.kind === "package") {
+			const item = new vscode.TreeItem(
+				node.packageRel || "workspace root",
+				vscode.TreeItemCollapsibleState.Expanded
+			);
+			item.iconPath = new vscode.ThemeIcon("package");
+			item.contextValue = "deskport.package";
+			return item;
+		}
+		const { rt } = node;
+		const running = terminals.get(rt.id)?.child !== undefined;
+		const item = new vscode.TreeItem(rt.target.label ?? rt.key, vscode.TreeItemCollapsibleState.None);
+		item.description = rt.target.command;
+		item.tooltip = running ? `${rt.target.command} — running` : rt.target.command;
+		item.iconPath = new vscode.ThemeIcon(running ? "debug-stop" : "rocket");
+		item.contextValue = running ? "deskport.target.running" : "deskport.target.idle";
+		item.command = { command: "deskport.launch", title: "Launch", arguments: [rt.id] };
+		return item;
+	}
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	extensionUri = context.extensionUri;
 	output = vscode.window.createOutputChannel("DeskPort");
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusItem.command = "deskport.menu";
+	targetsProvider = new TargetsProvider();
 
 	// Show the status bar item immediately, from the synchronous part of
 	// activation — so a slow or failing config scan can never leave DeskPort
@@ -119,8 +203,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		statusItem,
 		vscode.commands.registerCommand("deskport.menu", showMenu),
 		vscode.commands.registerCommand("deskport.init", initProject),
-		vscode.commands.registerCommand("deskport.launch", (id: string) => launchTarget(id)),
-		vscode.commands.registerCommand("deskport.stop", (id: string) => stopTarget(id)),
+		vscode.commands.registerCommand("deskport.launch", (arg: unknown) => launchTarget(asTargetId(arg))),
+		vscode.commands.registerCommand("deskport.stop", (arg: unknown) => stopTarget(asTargetId(arg))),
+		vscode.window.registerTreeDataProvider("deskport.targets", targetsProvider),
 		vscode.window.onDidCloseTerminal(forgetClosedTerminal),
 		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
 			workspace = resolveWorkspace();
@@ -494,85 +579,134 @@ async function launchTarget(id: string): Promise<void> {
 	// Where the target runs: <base>/<package folder>/<target cwd>.
 	const relFromRoot = joinRel(rt.packageRel, rt.target.cwd?.trim() || ".");
 
-	// Sync and install run inside a progress notification so the launch is
-	// visible. The target itself then runs in a terminal — created here on the
-	// local machine (DeskPort is a `ui` extension) or reused if one is open.
-	await vscode.window.withProgress(
+	// Sync + install run inside a progress notification. The result is the
+	// directory to run from, or undefined when a step failed (already reported).
+	const runCwd = await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `DeskPort: launching ${rt.key}`, cancellable: false },
-		async (progress): Promise<void> => {
-			let runCwd: string;
-
+		async (progress): Promise<string | undefined> => {
 			if (ws.remote === null) {
-				runCwd = join(ws.repoPath, relFromRoot);
-				output.appendLine(`[deskport] local repo: ${runCwd}`);
-			} else {
-				const mirror = mirrorDir();
-				runCwd = join(mirror, relFromRoot);
+				const cwd = join(ws.repoPath, relFromRoot);
+				output.appendLine(`[deskport] local repo: ${cwd}`);
+				return cwd;
+			}
+			const mirror = mirrorDir();
+			const cwd = join(mirror, relFromRoot);
 
-				// Cold start: mirror the whole repo once per launch session.
-				if (!mirrorSynced) {
-					output.appendLine(`[deskport] remote: ${ws.remote}:${ws.repoPath}`);
-					output.appendLine(`[deskport] mirror: ${mirror}`);
-					progress.report({ message: "syncing repo to this machine…" });
-					setBusy("syncing");
-					try {
-						await mkdir(mirror, { recursive: true });
-						await syncAll(ws, mirror);
-					} catch (err) {
-						return failLaunch(`initial sync failed: ${(err as Error).message}`);
-					}
-					mirrorSynced = true;
+			// Cold start: mirror the whole repo once per launch session.
+			if (!mirrorSynced) {
+				output.appendLine(`[deskport] remote: ${ws.remote}:${ws.repoPath}`);
+				output.appendLine(`[deskport] mirror: ${mirror}`);
+				progress.report({ message: "syncing repo to this machine…" });
+				setBusy("syncing");
+				try {
+					await mkdir(mirror, { recursive: true });
+					await syncAll(ws, mirror);
+				} catch (err) {
+					failLaunch(`initial sync failed: ${(err as Error).message}`);
+					return undefined;
 				}
-
-				// Per-package install, lazily on this package's first launch.
-				const installCmd = rt.pkg.config.install?.trim();
-				if (installCmd && !installedPackages.has(rt.packageRel)) {
-					progress.report({ message: `installing dependencies — ${installCmd}` });
-					setBusy(`installing ${rt.packageRel || "."}`);
-					output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
-					const install = await runShell(installCmd, join(mirror, rt.packageRel));
-					if (!install.ok) return failLaunch(`install failed: ${installCmd}`, install.tail);
-					installedPackages.add(rt.packageRel);
-				}
+				mirrorSynced = true;
 			}
 
-			progress.report({ message: `starting — ${rt.target.command}` });
-			output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${runCwd})`);
-
-			// The terminal's cwd must exist before VSCode spawns its shell.
-			// For a remote workspace, make sure the mirror folder is present.
-			if (ws.remote !== null) await mkdir(runCwd, { recursive: true });
-
-			// One terminal per target: reuse the open one, else create a new
-			// one. Running it as a terminal command lets the user see the
-			// program's live output and debug info.
-			let terminal = terminals.get(id);
-			if (!terminal) {
-				terminal = vscode.window.createTerminal({ name: `DeskPort: ${id}`, cwd: runCwd });
-				terminals.set(id, terminal);
+			// Per-package install, lazily on this package's first launch.
+			const installCmd = rt.pkg.config.install?.trim();
+			if (installCmd && !installedPackages.has(rt.packageRel)) {
+				progress.report({ message: `installing dependencies — ${installCmd}` });
+				setBusy(`installing ${rt.packageRel || "."}`);
+				output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
+				const install = await runShell(installCmd, join(mirror, rt.packageRel));
+				if (!install.ok) {
+					failLaunch(`install failed: ${installCmd}`, install.tail);
+					return undefined;
+				}
+				installedPackages.add(rt.packageRel);
 			}
-			terminal.show(true);
-			terminal.sendText(rt.target.command);
 
-			ensureSyncWatcher();
-			onActiveChange();
-			clearBusy();
+			await mkdir(cwd, { recursive: true });
+			return cwd;
 		}
 	);
+
+	clearBusy();
+	if (runCwd === undefined) return; // a sync/install step failed and reported it
+
+	// Run the target in its terminal — a pseudoterminal whose process DeskPort
+	// spawns itself (in the local extension host), so it runs on THIS machine.
+	let tt = terminals.get(id);
+	if (tt) {
+		tt.terminal.show(true);
+		startProcess(tt, rt, runCwd);
+	} else {
+		tt = createTargetTerminal(id);
+		tt.pending = { rt, runCwd };
+		terminals.set(id, tt);
+		tt.terminal.show(true); // triggers the pseudoterminal's open() -> startProcess
+	}
 }
 
-/** Close a target's terminal (which ends whatever runs in it). */
+/** Create a pseudoterminal-backed terminal for a target. */
+function createTargetTerminal(id: string): TargetTerminal {
+	const writer = new vscode.EventEmitter<string>();
+	const tt = { id, writer } as TargetTerminal;
+	const pty: vscode.Pseudoterminal = {
+		onDidWrite: writer.event,
+		// open() fires when the terminal is first shown — start the queued
+		// process then, so its output is not written before VSCode is listening.
+		open: () => {
+			if (tt.pending) {
+				const { rt, runCwd } = tt.pending;
+				tt.pending = undefined;
+				startProcess(tt, rt, runCwd);
+			}
+		},
+		close: () => tt.child?.kill(),
+		handleInput: (data) => {
+			if (data === "\u0003") tt.child?.kill("SIGINT"); // Ctrl+C
+		},
+	};
+	tt.terminal = vscode.window.createTerminal({ name: `DeskPort: ${id}`, pty });
+	return tt;
+}
+
+/** Spawn a target's process locally and stream it into its terminal. */
+function startProcess(tt: TargetTerminal, rt: ResolvedTarget, cwd: string): void {
+	tt.child?.kill(); // a relaunch replaces any process still running
+	output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${cwd})`);
+	tt.writer.fire(`\r\n\x1b[36m$ ${rt.target.command}\x1b[0m\r\n`);
+
+	const child = spawn(rt.target.command, { cwd, shell: true, env: { ...process.env, FORCE_COLOR: "1" } });
+	tt.child = child;
+	const stream = (d: Buffer): void => tt.writer.fire(d.toString().replace(/\r?\n/g, "\r\n"));
+	child.stdout?.on("data", stream);
+	child.stderr?.on("data", stream);
+	child.on("error", (err) => {
+		tt.writer.fire(`\r\n\x1b[31m[deskport] failed to start: ${err.message}\x1b[0m\r\n`);
+		if (tt.child === child) tt.child = undefined;
+		onActiveChange();
+	});
+	child.on("exit", (code, signal) => {
+		tt.writer.fire(`\r\n\x1b[90m[deskport] exited (code ${code ?? 0}${signal ? `, ${signal}` : ""})\x1b[0m\r\n`);
+		if (tt.child === child) tt.child = undefined;
+		onActiveChange();
+	});
+
+	ensureSyncWatcher();
+	onActiveChange();
+}
+
+/** Stop a target's running process; its terminal stays open for relaunch. */
 function stopTarget(id: string): void {
-	const terminal = terminals.get(id);
-	if (!terminal) return;
-	output.appendLine(`[deskport] closing terminal ${JSON.stringify(id)}`);
-	terminal.dispose(); // fires onDidCloseTerminal -> forgetClosedTerminal
+	const tt = terminals.get(id);
+	if (!tt?.child) return;
+	output.appendLine(`[deskport] stopping ${JSON.stringify(id)}`);
+	tt.child.kill();
 }
 
-/** Drop a terminal from the map once VSCode reports it closed. */
+/** When VSCode reports a terminal closed, kill its process and forget it. */
 function forgetClosedTerminal(closed: vscode.Terminal): void {
-	for (const [id, terminal] of terminals) {
-		if (terminal === closed) {
+	for (const [id, tt] of terminals) {
+		if (tt.terminal === closed) {
+			tt.child?.kill();
 			terminals.delete(id);
 			output.appendLine(`[deskport] terminal closed ${JSON.stringify(id)}`);
 			onActiveChange();
@@ -582,14 +716,23 @@ function forgetClosedTerminal(closed: vscode.Terminal): void {
 }
 
 function stopAll(): void {
-	for (const terminal of terminals.values()) terminal.dispose();
+	for (const tt of terminals.values()) {
+		tt.child?.kill();
+		tt.terminal.dispose();
+	}
 	terminals.clear();
 	stopSyncWatcher();
 }
 
+/** Whether any target process is currently running. */
+function anyRunning(): boolean {
+	for (const tt of terminals.values()) if (tt.child) return true;
+	return false;
+}
+
 function onActiveChange(): void {
-	if (terminals.size === 0) {
-		// Nothing launched anymore: drop the live mirror; re-sync/-install next time.
+	if (!anyRunning()) {
+		// No process running: drop the live mirror; re-sync/-install next launch.
 		stopSyncWatcher();
 		mirrorSynced = false;
 		installedPackages.clear();
@@ -597,41 +740,9 @@ function onActiveChange(): void {
 	updateStatus();
 }
 
+/** Reveal the DeskPort "Targets" panel (the status bar item's click action). */
 async function showMenu(): Promise<void> {
-	if (!workspace) return error("open a workspace folder (local or over SSH) first.");
-	for (const e of configErrors) output.appendLine(`[deskport] ${e}`);
-
-	if (configs.length === 0) {
-		if (configErrors.length > 0) return error(configErrors.join("; "));
-		const pick = await vscode.window.showQuickPick(["Initialize .deskport/ in this project"], {
-			placeHolder: "DeskPort is not set up for this project",
-		});
-		if (pick) await initProject();
-		return;
-	}
-
-	type Item = vscode.QuickPickItem & { id?: string; hasTerminal?: boolean };
-	const items: Item[] = [];
-	for (const pkg of configs) {
-		items.push({ label: pkg.packageRel || "workspace root", kind: vscode.QuickPickItemKind.Separator });
-		for (const [key, t] of Object.entries(pkg.config.targets)) {
-			const id = targetId(pkg.packageRel, key);
-			const hasTerminal = terminals.has(id);
-			items.push({
-				label: `${hasTerminal ? "$(debug-stop)" : "$(rocket)"} ${t.label ?? key}`,
-				description: hasTerminal ? "terminal open — select to close" : "select to launch",
-				detail: t.command,
-				id,
-				hasTerminal,
-			});
-		}
-	}
-	const chosen = await vscode.window.showQuickPick(items, {
-		placeHolder: "DeskPort — select a target",
-	});
-	if (!chosen?.id) return;
-	if (chosen.hasTerminal) stopTarget(chosen.id);
-	else await launchTarget(chosen.id);
+	await vscode.commands.executeCommand("deskport.targets.focus");
 }
 
 async function initProject(): Promise<void> {
@@ -718,11 +829,12 @@ function buildTooltip(): vscode.MarkdownString {
 		for (const [key, t] of Object.entries(pkg.config.targets)) {
 			const id = targetId(pkg.packageRel, key);
 			const label = t.label ?? key;
-			let line = `$(rocket) [${label}](${commandUri("deskport.launch", id)})`;
-			if (terminals.has(id)) {
-				line += `  ·  $(trash) [close terminal](${commandUri("deskport.stop", id)})`;
-			}
-			lines.push(line);
+			const running = terminals.get(id)?.child !== undefined;
+			lines.push(
+				running
+					? `$(debug-stop) [Stop “${label}”](${commandUri("deskport.stop", id)})`
+					: `$(rocket) [${label}](${commandUri("deskport.launch", id)})`
+			);
 		}
 		md.appendMarkdown(lines.join("\n\n"));
 	}
@@ -733,14 +845,16 @@ function buildTooltip(): vscode.MarkdownString {
 }
 
 function updateStatus(): void {
+	const running = [...terminals.values()].filter((tt) => tt.child).length;
 	if (busyText) {
 		statusItem.text = `$(sync~spin) DeskPort: ${busyText}`;
-	} else if (terminals.size > 0) {
-		statusItem.text = `$(rocket) DeskPort (${terminals.size})`;
+	} else if (running > 0) {
+		statusItem.text = `$(rocket) DeskPort (${running})`;
 	} else {
 		statusItem.text = "$(rocket) DeskPort";
 	}
 	statusItem.tooltip = buildTooltip();
+	targetsProvider.refresh();
 }
 
 function error(message: string): void {
