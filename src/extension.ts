@@ -86,6 +86,8 @@ interface Workspace {
 let extensionUri: vscode.Uri;
 let output: vscode.OutputChannel;
 let statusItem: vscode.StatusBarItem;
+/** Experimental Chat status entry — set only when the proposed API is enabled. */
+let chatStatusItem: vscode.ChatStatusItem | undefined;
 let workspace: Workspace | undefined;
 let configs: DiscoveredConfig[] = [];
 let configErrors: string[] = [];
@@ -106,17 +108,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusItem.command = "deskport.menu";
 
+	// Experimental: when the `chatStatusItem` proposed API is enabled — VSCode
+	// launched with `--enable-proposed-api cldmv.deskport` — also surface
+	// DeskPort in the Chat status, the same area Copilot's status popup uses.
+	// Without the flag the API is absent, so feature-detect and fall back.
+	if (typeof vscode.window.createChatStatusItem === "function") {
+		chatStatusItem = vscode.window.createChatStatusItem("deskport.targets");
+		chatStatusItem.show();
+	}
+
 	// Show the status bar item immediately, from the synchronous part of
 	// activation — so a slow or failing config scan can never leave DeskPort
 	// invisible. Config discovery happens afterwards and refreshes the item.
 	workspace = resolveWorkspace();
 	updateStatus();
 	statusItem.show();
-	output.appendLine("[deskport] extension activated");
+	output.appendLine(
+		`[deskport] extension activated — chat status item ${chatStatusItem ? "active" : "unavailable (proposed API off)"}`
+	);
 
 	context.subscriptions.push(
 		output,
 		statusItem,
+		{ dispose: () => chatStatusItem?.dispose() },
 		vscode.commands.registerCommand("deskport.menu", showMenu),
 		vscode.commands.registerCommand("deskport.init", initProject),
 		vscode.commands.registerCommand("deskport.launch", (id: string) => launchTarget(id)),
@@ -728,6 +742,31 @@ function buildTooltip(): vscode.MarkdownString {
 	return md;
 }
 
+/**
+ * Populate the experimental Chat status item (when the `chatStatusItem`
+ * proposed API is enabled). `description` and `detail` render Markdown links,
+ * so each target becomes a clickable launch link.
+ */
+function refreshChatStatus(): void {
+	if (!chatStatusItem) return;
+	chatStatusItem.title = "DeskPort";
+	if (busyText) {
+		chatStatusItem.description = `$(sync~spin) ${busyText}…`;
+		chatStatusItem.detail = undefined;
+		return;
+	}
+	const targets = allTargets();
+	if (targets.length === 0) {
+		chatStatusItem.description = "no targets";
+		chatStatusItem.detail = configErrors[0] ?? "no .deskport/config.json found";
+		return;
+	}
+	chatStatusItem.description = `$(rocket) ${targets.length} target${targets.length === 1 ? "" : "s"}`;
+	chatStatusItem.detail = targets
+		.map((t) => `[${t.target.label ?? t.key}](${commandUri("deskport.launch", t.id)})`)
+		.join("  ·  ");
+}
+
 function updateStatus(): void {
 	if (busyText) {
 		statusItem.text = `$(sync~spin) DeskPort: ${busyText}`;
@@ -737,6 +776,7 @@ function updateStatus(): void {
 		statusItem.text = "$(rocket) DeskPort";
 	}
 	statusItem.tooltip = buildTooltip();
+	refreshChatStatus();
 }
 
 function error(message: string): void {
