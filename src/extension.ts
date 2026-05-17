@@ -24,7 +24,7 @@
  */
 
 import * as vscode from "vscode";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdir, readdir, rm, stat as statLocal, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -97,7 +97,8 @@ let syncWatcher: vscode.FileSystemWatcher | undefined;
 let mirrorSynced = false;
 /** packageRel values whose `install` command has run this session. */
 const installedPackages = new Set<string>();
-const running = new Map<string, ChildProcess>();
+/** Open terminals, keyed by target id — one per target, reused across launches. */
+const terminals = new Map<string, vscode.Terminal>();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	extensionUri = context.extensionUri;
@@ -120,6 +121,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("deskport.init", initProject),
 		vscode.commands.registerCommand("deskport.launch", (id: string) => launchTarget(id)),
 		vscode.commands.registerCommand("deskport.stop", (id: string) => stopTarget(id)),
+		vscode.window.onDidCloseTerminal(forgetClosedTerminal),
 		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
 			workspace = resolveWorkspace();
 			await loadConfigs();
@@ -485,21 +487,16 @@ async function launchTarget(id: string): Promise<void> {
 
 	const rt = findTarget(id);
 	if (!rt) return error(`no target ${JSON.stringify(id)} found in any ${CONFIG_REL}.`);
-	if (running.has(id)) {
-		output.show(true);
-		return void info(`target ${JSON.stringify(rt.key)} is already running.`);
-	}
 
-	output.show(true);
 	output.appendLine("");
 	output.appendLine(`[deskport] launch ${JSON.stringify(id)}`);
 
 	// Where the target runs: <base>/<package folder>/<target cwd>.
 	const relFromRoot = joinRel(rt.packageRel, rt.target.cwd?.trim() || ".");
 
-	// Sync, install and spawn run inside a progress notification so the launch
-	// is visible. The notification closes once the process is spawned; a
-	// failure after that surfaces as its own error notification (see below).
+	// Sync and install run inside a progress notification so the launch is
+	// visible. The target itself then runs in a terminal — created here on the
+	// local machine (DeskPort is a `ui` extension) or reused if one is open.
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `DeskPort: launching ${rt.key}`, cancellable: false },
 		async (progress): Promise<void> => {
@@ -540,59 +537,55 @@ async function launchTarget(id: string): Promise<void> {
 			}
 
 			progress.report({ message: `starting — ${rt.target.command}` });
-			setBusy(`launching ${rt.key}`);
 			output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${runCwd})`);
-			const child = spawn(rt.target.command, { cwd: runCwd, shell: true });
-			// Keep a bounded tail of the target's output so a crash can report it.
-			let outputTail = "";
-			const capture = (d: Buffer): void => {
-				const text = d.toString();
-				output.append(text);
-				outputTail = (outputTail + text).slice(-OUTPUT_TAIL_LIMIT);
-			};
-			child.stdout?.on("data", capture);
-			child.stderr?.on("data", capture);
-			child.on("error", (err) => {
-				output.appendLine(`[deskport] ${JSON.stringify(id)} failed to start: ${err.message}`);
-				running.delete(id);
-				onRunningChange();
-				failLaunch(`target ${JSON.stringify(rt.key)} failed to start.`, err.message);
-			});
-			child.on("exit", (code, signal) => {
-				output.appendLine(
-					`[deskport] ${JSON.stringify(id)} exited (code ${code ?? 0}${signal ? `, ${signal}` : ""})`
-				);
-				// A non-zero code is a crash; null means we killed it (a Stop).
-				const crashed = code !== 0 && code !== null;
-				running.delete(id);
-				onRunningChange();
-				if (crashed) {
-					failLaunch(`target ${JSON.stringify(rt.key)} exited with code ${code}.`, outputTail);
-				}
-			});
 
-			running.set(id, child);
+			// One terminal per target: reuse the open one, else create a new
+			// one. Running it as a terminal command lets the user see the
+			// program's live output and debug info.
+			let terminal = terminals.get(id);
+			if (!terminal) {
+				terminal = vscode.window.createTerminal({ name: `DeskPort: ${id}`, cwd: runCwd });
+				terminals.set(id, terminal);
+			}
+			terminal.show(true);
+			terminal.sendText(rt.target.command);
+
 			ensureSyncWatcher();
+			onActiveChange();
 			clearBusy();
 		}
 	);
 }
 
+/** Close a target's terminal (which ends whatever runs in it). */
 function stopTarget(id: string): void {
-	const child = running.get(id);
-	if (!child) return;
-	output.appendLine(`[deskport] stopping ${JSON.stringify(id)}`);
-	child.kill();
+	const terminal = terminals.get(id);
+	if (!terminal) return;
+	output.appendLine(`[deskport] closing terminal ${JSON.stringify(id)}`);
+	terminal.dispose(); // fires onDidCloseTerminal -> forgetClosedTerminal
+}
+
+/** Drop a terminal from the map once VSCode reports it closed. */
+function forgetClosedTerminal(closed: vscode.Terminal): void {
+	for (const [id, terminal] of terminals) {
+		if (terminal === closed) {
+			terminals.delete(id);
+			output.appendLine(`[deskport] terminal closed ${JSON.stringify(id)}`);
+			onActiveChange();
+			return;
+		}
+	}
 }
 
 function stopAll(): void {
-	for (const id of [...running.keys()]) stopTarget(id);
+	for (const terminal of terminals.values()) terminal.dispose();
+	terminals.clear();
 	stopSyncWatcher();
 }
 
-function onRunningChange(): void {
-	if (running.size === 0) {
-		// Session over: drop the live mirror, and re-sync/-install next time.
+function onActiveChange(): void {
+	if (terminals.size === 0) {
+		// Nothing launched anymore: drop the live mirror; re-sync/-install next time.
 		stopSyncWatcher();
 		mirrorSynced = false;
 		installedPackages.clear();
@@ -613,19 +606,19 @@ async function showMenu(): Promise<void> {
 		return;
 	}
 
-	type Item = vscode.QuickPickItem & { id?: string; isRunning?: boolean };
+	type Item = vscode.QuickPickItem & { id?: string; hasTerminal?: boolean };
 	const items: Item[] = [];
 	for (const pkg of configs) {
 		items.push({ label: pkg.packageRel || "workspace root", kind: vscode.QuickPickItemKind.Separator });
 		for (const [key, t] of Object.entries(pkg.config.targets)) {
 			const id = targetId(pkg.packageRel, key);
-			const isRunning = running.has(id);
+			const hasTerminal = terminals.has(id);
 			items.push({
-				label: `${isRunning ? "$(debug-stop)" : "$(rocket)"} ${t.label ?? key}`,
-				description: isRunning ? "running — select to stop" : "select to launch",
+				label: `${hasTerminal ? "$(debug-stop)" : "$(rocket)"} ${t.label ?? key}`,
+				description: hasTerminal ? "terminal open — select to close" : "select to launch",
 				detail: t.command,
 				id,
-				isRunning,
+				hasTerminal,
 			});
 		}
 	}
@@ -633,7 +626,7 @@ async function showMenu(): Promise<void> {
 		placeHolder: "DeskPort — select a target",
 	});
 	if (!chosen?.id) return;
-	if (chosen.isRunning) stopTarget(chosen.id);
+	if (chosen.hasTerminal) stopTarget(chosen.id);
 	else await launchTarget(chosen.id);
 }
 
@@ -721,11 +714,11 @@ function buildTooltip(): vscode.MarkdownString {
 		for (const [key, t] of Object.entries(pkg.config.targets)) {
 			const id = targetId(pkg.packageRel, key);
 			const label = t.label ?? key;
-			lines.push(
-				running.has(id)
-					? `$(debug-stop) [Stop “${label}”](${commandUri("deskport.stop", id)})`
-					: `$(rocket) [${label}](${commandUri("deskport.launch", id)})`
-			);
+			let line = `$(rocket) [${label}](${commandUri("deskport.launch", id)})`;
+			if (terminals.has(id)) {
+				line += `  ·  $(trash) [close terminal](${commandUri("deskport.stop", id)})`;
+			}
+			lines.push(line);
 		}
 		md.appendMarkdown(lines.join("\n\n"));
 	}
@@ -738,8 +731,8 @@ function buildTooltip(): vscode.MarkdownString {
 function updateStatus(): void {
 	if (busyText) {
 		statusItem.text = `$(sync~spin) DeskPort: ${busyText}`;
-	} else if (running.size > 0) {
-		statusItem.text = `$(debug-stop) DeskPort (${running.size})`;
+	} else if (terminals.size > 0) {
+		statusItem.text = `$(rocket) DeskPort (${terminals.size})`;
 	} else {
 		statusItem.text = "$(rocket) DeskPort";
 	}

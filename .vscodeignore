@@ -2,6 +2,7 @@
 .configs/**
 src/**
 examples/**
+docs/**
 node_modules/**
 **/*.map
 **/tsconfig.json
