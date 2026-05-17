@@ -44,6 +44,8 @@ interface TargetConfig {
 	label?: string;
 	/** Directory to run from, relative to this config's folder; defaults to ".". */
 	cwd?: string;
+	/** Card icon: a `data:` URI, an image path relative to this folder, or raw base64. */
+	icon?: string;
 }
 
 interface LauncherConfig {
@@ -104,7 +106,9 @@ interface TargetTerminal {
 let extensionUri: vscode.Uri;
 let output: vscode.OutputChannel;
 let statusItem: vscode.StatusBarItem;
-let targetsProvider: TargetsProvider;
+let targetsProvider: TargetsViewProvider;
+/** The default card icon (resources/panel-icon.svg), loaded at activation. */
+let rocketSvg = "";
 let workspace: Workspace | undefined;
 let configs: DiscoveredConfig[] = [];
 let configErrors: string[] = [];
@@ -118,15 +122,6 @@ let mirrorSynced = false;
 const installedPackages = new Set<string>();
 /** Open terminals, keyed by target id — one per target, reused across launches. */
 const terminals = new Map<string, TargetTerminal>();
-
-/** A detail row shown under a target — icon, text, and an optional click action. */
-type DetailNode = { kind: "detail"; icon: vscode.ThemeIcon; text: string; action?: vscode.Command };
-
-/**
- * A node in the DeskPort targets tree: a package group, a launchable target,
- * or a detail row shown when a target is expanded.
- */
-type TreeNode = { kind: "package"; packageRel: string } | { kind: "target"; rt: ResolvedTarget } | DetailNode;
 
 /** The run state of a target, shown in the sidebar. */
 type TargetStatus = "idle" | "running" | "exited" | "failed" | "stopped";
@@ -142,22 +137,6 @@ function targetStatus(id: string): TargetStatus {
 	return "failed";
 }
 
-/** A themed status icon — shared by the target row and its status detail row. */
-function statusIcon(status: TargetStatus): vscode.ThemeIcon {
-	switch (status) {
-		case "running":
-			return new vscode.ThemeIcon("play-circle", new vscode.ThemeColor("charts.green"));
-		case "exited":
-			return new vscode.ThemeIcon("pass-filled", new vscode.ThemeColor("charts.green"));
-		case "failed":
-			return new vscode.ThemeIcon("error", new vscode.ThemeColor("list.errorForeground"));
-		case "stopped":
-			return new vscode.ThemeIcon("circle-slash", new vscode.ThemeColor("charts.yellow"));
-		default:
-			return new vscode.ThemeIcon("circle-outline");
-	}
-}
-
 /** A target's status as text — `failed` carries its exit code. */
 function statusLabel(id: string): string {
 	const status = targetStatus(id);
@@ -168,117 +147,234 @@ function statusLabel(id: string): string {
 	return status;
 }
 
-/** Resolve a package's targets into tree nodes. */
-function targetsIn(pkg: DiscoveredConfig): TreeNode[] {
-	return Object.entries(pkg.config.targets).map(([key, target]): TreeNode => ({
-		kind: "target",
-		rt: { id: targetId(pkg.packageRel, key), key, packageRel: pkg.packageRel, pkg, target },
-	}));
+/** One target rendered as a card in the sidebar webview. */
+interface CardData {
+	id: string;
+	label: string;
+	command: string;
+	folder: string;
+	status: TargetStatus;
+	statusLabel: string;
+	/** A resolved `data:` URI for a custom icon, or undefined for the default. */
+	icon?: string;
 }
 
-/** The detail rows shown when a target is expanded; each row is clickable. */
-function detailsOf(rt: ResolvedTarget): DetailNode[] {
-	// Command — opens the .deskport/config.json that defines this target.
-	const command: DetailNode = { kind: "detail", icon: new vscode.ThemeIcon("terminal"), text: rt.target.command };
-	// Folder — reveals the package folder in the Explorer.
-	const folder: DetailNode = {
-		kind: "detail",
-		icon: new vscode.ThemeIcon("folder"),
-		text: rt.packageRel || "workspace root",
-	};
-	if (workspace) {
-		const configRel = rt.packageRel ? `${rt.packageRel}/${CONFIG_REL}` : CONFIG_REL;
-		command.action = {
-			command: "vscode.open",
-			title: "Open the .deskport/config.json",
-			arguments: [vscode.Uri.joinPath(workspace.folder.uri, configRel)],
-		};
-		folder.action = {
-			command: "revealInExplorer",
-			title: "Reveal the folder in Explorer",
-			arguments: [rt.packageRel ? vscode.Uri.joinPath(workspace.folder.uri, rt.packageRel) : workspace.folder.uri],
-		};
-	}
-	// Status — opens (focusing or creating) the target's terminal.
-	const status: DetailNode = {
-		kind: "detail",
-		icon: statusIcon(targetStatus(rt.id)),
-		text: statusLabel(rt.id),
-		action: { command: "deskport.openTerminal", title: "Open the terminal", arguments: [rt.id] },
-	};
+const IMAGE_EXT = /\.(png|svg|jpe?g|gif|ico|webp)$/i;
+/** Resolved custom icons keyed by target id; cleared when configs reload. */
+const iconCache = new Map<string, string | undefined>();
 
-	const rows: DetailNode[] = [command, folder, status];
-	const cwd = rt.target.cwd?.trim();
-	if (cwd && cwd !== ".") {
-		rows.push({ kind: "detail", icon: new vscode.ThemeIcon("folder-opened"), text: `cwd: ${cwd}` });
-	}
-	return rows;
+function imageMime(path: string): string {
+	if (/\.svg$/i.test(path)) return "image/svg+xml";
+	if (/\.jpe?g$/i.test(path)) return "image/jpeg";
+	if (/\.gif$/i.test(path)) return "image/gif";
+	if (/\.ico$/i.test(path)) return "image/x-icon";
+	if (/\.webp$/i.test(path)) return "image/webp";
+	return "image/png";
 }
 
-/** A `deskport.launch`/`stop` argument: a target id (string) or a tree node. */
-function asTargetId(arg: unknown): string {
-	if (typeof arg === "string") return arg;
-	if (arg && typeof arg === "object" && (arg as TreeNode).kind === "target") {
-		return (arg as { rt: ResolvedTarget }).rt.id;
+/**
+ * Resolve a target's optional `icon` to a `data:` URI. The icon may be a
+ * `data:` URI as-is, a path (relative to the config's folder) to an image
+ * file, or raw base64 image data. Undefined falls back to the default rocket.
+ */
+async function resolveIcon(rt: ResolvedTarget): Promise<string | undefined> {
+	if (iconCache.has(rt.id)) return iconCache.get(rt.id);
+	let resolved: string | undefined;
+	const spec = rt.target.icon?.trim();
+	if (spec?.startsWith("data:")) {
+		resolved = spec;
+	} else if (spec && IMAGE_EXT.test(spec) && workspace) {
+		try {
+			const rel = joinRel(rt.packageRel, spec);
+			const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspace.folder.uri, rel));
+			resolved = `data:${imageMime(spec)};base64,${Buffer.from(bytes).toString("base64")}`;
+		} catch {
+			resolved = undefined;
+		}
+	} else if (spec) {
+		// Anything else is treated as raw base64 image data.
+		resolved = `data:image/png;base64,${spec.replace(/\s+/g, "")}`;
 	}
-	return "";
+	iconCache.set(rt.id, resolved);
+	return resolved;
 }
 
-/** Backs the "Targets" view — a tree of targets, grouped by package. */
-class TargetsProvider implements vscode.TreeDataProvider<TreeNode> {
-	private readonly emitter = new vscode.EventEmitter<void>();
-	readonly onDidChangeTreeData = this.emitter.event;
-
-	/** Re-render the tree — called when configs or running state change. */
-	refresh(): void {
-		this.emitter.fire();
+/** Build the sidebar's state — one card per target, with resolved icons. */
+async function buildViewState(): Promise<{ cards: CardData[]; errors: string[] }> {
+	const cards: CardData[] = [];
+	for (const rt of allTargets()) {
+		cards.push({
+			id: rt.id,
+			label: rt.target.label ?? rt.key,
+			command: rt.target.command,
+			folder: rt.packageRel || "workspace root",
+			status: targetStatus(rt.id),
+			statusLabel: statusLabel(rt.id),
+			icon: await resolveIcon(rt),
+		});
 	}
+	return { cards, errors: configErrors };
+}
 
-	getChildren(node?: TreeNode): TreeNode[] {
-		if (!node) {
-			// A single config: list its targets directly; otherwise group by package.
-			const single = configs.length === 1 ? configs[0] : undefined;
-			if (single) return targetsIn(single);
-			return configs.map((c): TreeNode => ({ kind: "package", packageRel: c.packageRel }));
-		}
-		if (node.kind === "package") {
-			const pkg = configs.find((c) => c.packageRel === node.packageRel);
-			return pkg ? targetsIn(pkg) : [];
-		}
-		// Expanding a target reveals its detail rows.
-		if (node.kind === "target") return detailsOf(node.rt);
-		return [];
+/** Open the `.deskport/config.json` that defines a target. */
+function openTargetConfig(id: string): void {
+	const rt = findTarget(id);
+	if (!rt || !workspace) return;
+	const configRel = rt.packageRel ? `${rt.packageRel}/${CONFIG_REL}` : CONFIG_REL;
+	void vscode.commands.executeCommand("vscode.open", vscode.Uri.joinPath(workspace.folder.uri, configRel));
+}
+
+/** Reveal a target's package folder in the Explorer. */
+function revealTargetFolder(id: string): void {
+	const rt = findTarget(id);
+	if (!rt || !workspace) return;
+	const uri = rt.packageRel ? vscode.Uri.joinPath(workspace.folder.uri, rt.packageRel) : workspace.folder.uri;
+	void vscode.commands.executeCommand("revealInExplorer", uri);
+}
+
+/** A random nonce for the webview's Content-Security-Policy. */
+function nonce(): string {
+	return Array.from({ length: 20 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+}
+
+/** The HTML for the targets webview; cards are rendered client-side from state. */
+function viewHtml(webview: vscode.Webview): string {
+	const n = nonce();
+	const csp = `default-src 'none'; img-src data: ${webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${n}';`;
+	return `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<style>
+body { margin: 0; padding: 0; color: var(--vscode-foreground); font: var(--vscode-font-size) var(--vscode-font-family); }
+.card { display: flex; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,.18)); }
+.card:hover { background: var(--vscode-list-hoverBackground); }
+.icon { flex: none; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; color: var(--vscode-foreground); }
+.icon img { max-width: 36px; max-height: 36px; }
+.icon svg { width: 28px; height: 28px; }
+.body { flex: 1; min-width: 0; }
+.name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmd, .meta { color: var(--vscode-descriptionForeground); font-size: .92em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmd { margin: 2px 0; }
+.link { cursor: pointer; }
+.link:hover { color: var(--vscode-textLink-foreground); text-decoration: underline; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; background: var(--vscode-descriptionForeground); }
+.s-running, .s-exited { background: var(--vscode-charts-green, #89d185); }
+.s-failed { background: var(--vscode-errorForeground, #f14c4c); }
+.s-stopped { background: var(--vscode-charts-yellow, #cca700); }
+.st-failed { color: var(--vscode-errorForeground, #f14c4c); }
+.actions { flex: none; }
+button { font: inherit; cursor: pointer; border: none; border-radius: 2px; padding: 4px 11px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
+button:hover { background: var(--vscode-button-hoverBackground); }
+button.stop { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+button.stop:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.empty { padding: 16px 12px; color: var(--vscode-descriptionForeground); }
+.empty button { margin-top: 10px; }
+.err { padding: 8px 12px; color: var(--vscode-errorForeground); font-size: .92em; }
+</style></head><body>
+<div id="root"></div>
+<script nonce="${n}">
+const api = acquireVsCodeApi();
+const ROCKET = ${JSON.stringify(rocketSvg)};
+const root = document.getElementById("root");
+function send(type, id) { api.postMessage({ type: type, id: id }); }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function card(c) {
+	const wrap = el("div", "card");
+	const icon = el("div", "icon");
+	if (c.icon) { const img = el("img"); img.src = c.icon; icon.appendChild(img); }
+	else { icon.innerHTML = ROCKET; }
+	wrap.appendChild(icon);
+	const body = el("div", "body");
+	body.appendChild(el("div", "name", c.label));
+	const cmd = el("div", "cmd link", c.command);
+	cmd.title = "Open the .deskport/config.json";
+	cmd.onclick = function () { send("openConfig", c.id); };
+	body.appendChild(cmd);
+	const meta = el("div", "meta");
+	const folder = el("span", "link", c.folder);
+	folder.title = "Reveal the folder";
+	folder.onclick = function () { send("revealFolder", c.id); };
+	meta.appendChild(folder);
+	meta.appendChild(document.createTextNode("  ·  "));
+	const status = el("span", "link" + (c.status === "failed" ? " st-failed" : ""));
+	status.title = "Open the terminal";
+	status.onclick = function () { send("openTerminal", c.id); };
+	status.appendChild(el("span", "dot s-" + c.status));
+	status.appendChild(document.createTextNode(c.statusLabel));
+	meta.appendChild(status);
+	body.appendChild(meta);
+	wrap.appendChild(body);
+	const actions = el("div", "actions");
+	const running = c.status === "running";
+	const btn = el("button", running ? "stop" : "", running ? "Stop" : "Run");
+	btn.onclick = function () { send(running ? "stop" : "launch", c.id); };
+	actions.appendChild(btn);
+	wrap.appendChild(actions);
+	return wrap;
+}
+function render(state) {
+	root.textContent = "";
+	for (const e of state.errors || []) root.appendChild(el("div", "err", e));
+	if (!state.cards || !state.cards.length) {
+		const d = el("div", "empty", "No DeskPort targets found in this workspace.");
+		const b = el("button", "", "Initialize Project");
+		b.onclick = function () { send("init"); };
+		d.appendChild(document.createElement("br"));
+		d.appendChild(b);
+		root.appendChild(d);
+		return;
 	}
+	for (const c of state.cards) root.appendChild(card(c));
+}
+window.addEventListener("message", function (e) { if (e.data && e.data.type === "state") render(e.data); });
+send("ready");
+</script></body></html>`;
+}
 
-	getTreeItem(node: TreeNode): vscode.TreeItem {
-		if (node.kind === "package") {
-			const item = new vscode.TreeItem(
-				node.packageRel || "workspace root",
-				vscode.TreeItemCollapsibleState.Expanded
-			);
-			item.iconPath = new vscode.ThemeIcon("package");
-			item.contextValue = "deskport.package";
-			return item;
-		}
-		if (node.kind === "detail") {
-			const item = new vscode.TreeItem(node.text, vscode.TreeItemCollapsibleState.None);
-			item.iconPath = node.icon;
-			if (node.action) {
-				item.command = node.action;
-				item.tooltip = node.action.title;
+/** Backs the "Targets" sidebar — a webview of target cards. */
+class TargetsViewProvider implements vscode.WebviewViewProvider {
+	private view: vscode.WebviewView | undefined;
+
+	resolveWebviewView(view: vscode.WebviewView): void {
+		this.view = view;
+		view.webview.options = { enableScripts: true };
+		view.webview.html = viewHtml(view.webview);
+		view.webview.onDidReceiveMessage((msg: { type?: string; id?: string }) => {
+			const id = msg.id ?? "";
+			switch (msg.type) {
+				case "launch":
+					void launchTarget(id);
+					break;
+				case "stop":
+					stopTarget(id);
+					break;
+				case "openTerminal":
+					openTerminal(id);
+					break;
+				case "openConfig":
+					openTargetConfig(id);
+					break;
+				case "revealFolder":
+					revealTargetFolder(id);
+					break;
+				case "init":
+					void initProject();
+					break;
+				case "ready":
+					void this.refresh();
+					break;
 			}
-			return item;
-		}
-		// A target — collapsible so selecting it reveals details. No `command`,
-		// so a click only expands/selects; the inline rocket button launches it.
-		const { rt } = node;
-		const status = targetStatus(rt.id);
-		const item = new vscode.TreeItem(rt.target.label ?? rt.key, vscode.TreeItemCollapsibleState.Collapsed);
-		item.description = status === "idle" ? "" : statusLabel(rt.id);
-		item.tooltip = rt.target.command;
-		item.iconPath = statusIcon(status);
-		item.contextValue = status === "running" ? "deskport.target.running" : "deskport.target.idle";
-		return item;
+		});
+		view.onDidChangeVisibility(() => {
+			if (view.visible) void this.refresh();
+		});
+	}
+
+	/** Push the current target list to the webview, if it is resolved. */
+	async refresh(): Promise<void> {
+		if (!this.view) return;
+		const state = await buildViewState();
+		void this.view.webview.postMessage({ type: "state", ...state });
 	}
 }
 
@@ -287,7 +383,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	output = vscode.window.createOutputChannel("DeskPort");
 	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
 	statusItem.command = "deskport.menu";
-	targetsProvider = new TargetsProvider();
+	targetsProvider = new TargetsViewProvider();
 
 	// Show the status bar item immediately, from the synchronous part of
 	// activation — so a slow or failing config scan can never leave DeskPort
@@ -302,10 +398,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		statusItem,
 		vscode.commands.registerCommand("deskport.menu", showMenu),
 		vscode.commands.registerCommand("deskport.init", initProject),
-		vscode.commands.registerCommand("deskport.launch", (arg: unknown) => launchTarget(asTargetId(arg))),
-		vscode.commands.registerCommand("deskport.stop", (arg: unknown) => stopTarget(asTargetId(arg))),
+		vscode.commands.registerCommand("deskport.launch", (id: string) => launchTarget(id)),
+		vscode.commands.registerCommand("deskport.stop", (id: string) => stopTarget(id)),
 		vscode.commands.registerCommand("deskport.openTerminal", (id: string) => openTerminal(id)),
-		vscode.window.registerTreeDataProvider("deskport.targets", targetsProvider),
+		vscode.window.registerWebviewViewProvider("deskport.targets", targetsProvider),
 		vscode.window.onDidCloseTerminal(forgetClosedTerminal),
 		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
 			workspace = resolveWorkspace();
@@ -317,6 +413,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		{ dispose: stopSyncWatcher }
 	);
 	registerWatchers();
+
+	try {
+		rocketSvg = Buffer.from(
+			await vscode.workspace.fs.readFile(vscode.Uri.joinPath(extensionUri, "resources", "panel-icon.svg"))
+		).toString("utf8");
+	} catch {
+		/* the default card icon is blank if the asset cannot be read */
+	}
 
 	try {
 		await loadConfigs();
@@ -373,6 +477,7 @@ function decodeHost(raw: string): string {
 async function loadConfigs(): Promise<void> {
 	configs = [];
 	configErrors = [];
+	iconCache.clear();
 	if (!workspace) return;
 	await discoverConfigs(workspace.folder.uri, "");
 	// Root config first, then nested ones in path order — a stable menu order.
@@ -989,7 +1094,7 @@ function updateStatus(): void {
 		statusItem.text = "$(rocket) DeskPort";
 	}
 	statusItem.tooltip = buildTooltip();
-	targetsProvider.refresh();
+	void targetsProvider.refresh();
 }
 
 function error(message: string): void {
