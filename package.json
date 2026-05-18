@@ -42,6 +42,15 @@
 	"categories": [
 		"Other"
 	],
+	"keywords": [
+		"remote-ssh",
+		"remote development",
+		"electron",
+		"launcher",
+		"gui",
+		"dev server",
+		"monorepo"
+	],
 	"main": "./out/extension.js",
 	"activationEvents": [
 		"onStartupFinished"
