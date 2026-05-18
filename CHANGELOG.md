@@ -5,6 +5,14 @@ All notable changes to the DeskPort extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-05-17
+
+### Changed
+
+- Marketplace metadata only: added search keywords, `author` / `funding` /
+  `sponsor` fields, and an explicit `Apache-2.0` license identifier. No
+  functional changes.
+
 ## [0.7.0] - 2026-05-17
 
 First public release.
@@ -40,4 +48,5 @@ First public release.
 - `out/` packaging is restricted to compiled JavaScript so stray files cannot
   leak into the `.vsix`.
 
+[0.7.1]: https://github.com/CLDMV/deskport/releases/tag/v0.7.1
 [0.7.0]: https://github.com/CLDMV/deskport/releases/tag/v0.7.0
