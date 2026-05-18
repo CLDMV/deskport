@@ -5,7 +5,26 @@
 	"version": "0.7.0",
 	"publisher": "cldmv",
 	"icon": "resources/logo.png",
-	"license": "SEE LICENSE IN LICENSE",
+	"license": "Apache-2.0",
+	"author": {
+		"name": "Shinrai",
+		"company": "CLDMV",
+		"email": "git+npm@cldmv.net",
+		"url": "https://cldmv.net"
+	},
+	"contributors": [
+		{
+			"name": "CLDMV",
+			"url": "https://github.com/CLDMV"
+		}
+	],
+	"funding": {
+		"type": "github",
+		"url": "https://github.com/sponsors/shinrai"
+	},
+	"sponsor": {
+		"url": "https://github.com/sponsors/shinrai"
+	},
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/CLDMV/deskport.git"
