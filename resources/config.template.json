@@ -1,5 +1,4 @@
 {
-	"mirrorName": "my-app",
 	"install": "pnpm install",
 	"excludes": ["node_modules", ".git", "out", "dist", "release"],
 	"targets": {

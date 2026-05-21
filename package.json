@@ -2,7 +2,7 @@
 	"name": "deskport",
 	"displayName": "DeskPort",
 	"description": "Sync an SSH-remote workspace to your local machine and launch configured dev targets — for Electron and other GUI apps that must run where the display is.",
-	"version": "0.7.1",
+	"version": "0.8.0",
 	"publisher": "cldmv",
 	"icon": "resources/logo.png",
 	"license": "Apache-2.0",
@@ -94,7 +94,7 @@
 					"type": "string",
 					"default": "",
 					"scope": "window",
-					"markdownDescription": "Base directory on the **local machine** where remote workspaces are mirrored (cloned). Each project gets its own subfolder, named by the `mirrorName` in its `.deskport/config.json`.\n\nLeave empty to use the default `~/.deskport-mirrors`. A leading `~` expands to your home directory. Because this is a local filesystem path, it can be set globally in **User** settings or overridden per project in **Workspace** settings."
+					"markdownDescription": "Base directory on the **local machine** where remote workspaces are mirrored (cloned). Each launch lands under `<clonePath>/<ssh-host>/<absolute-remote-path>/`, so the same remote folder always maps to the same local path regardless of which parent directory you opened in VSCode.\n\nLeave empty to use the default `~/.deskport-mirrors`. A leading `~` expands to your home directory. Because this is a local filesystem path, it can be set globally in **User** settings or overridden per project in **Workspace** settings."
 				}
 			}
 		}

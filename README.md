@@ -45,7 +45,6 @@ writes two files under `.deskport/`:
 
   ```json
   {
-  	"mirrorName": "my-app",
   	"install": "pnpm install",
   	"excludes": ["node_modules", ".git", "out", "dist", "release"],
   	"targets": {
@@ -55,9 +54,11 @@ writes two files under `.deskport/`:
   }
   ```
 
-  Each target is a shell `command` run from `cwd` (relative to the repo root).
-  `install` runs once after the first sync. `mirrorName` is the local mirror
-  folder under `~/.deskport-mirrors/`.
+  Each target is a shell `command` run from `cwd` (relative to this config's
+  folder). `install` runs once, in this config's folder, after the first sync.
+  When you launch a target, DeskPort mirrors **only that config's folder** —
+  not the whole workspace — into `~/.deskport-mirrors/<ssh-host>/<remote-path>/`,
+  so opening a parent that contains many unrelated projects is safe.
 
 - `trigger.mjs` — lets the remote start a target (see below).
 
@@ -88,10 +89,12 @@ copies each remote edit so it hot-reloads.
 The extension reads its settings from VSCode itself — there is no separate UI.
 Open **Settings** and search for "DeskPort":
 
-- **`deskport.clonePath`** — base directory on the **local machine**
-  where remote workspaces are mirrored. Each project gets a subfolder named by
-  its `mirrorName`. Empty (the default) means `~/.deskport-mirrors`; a
-  leading `~` expands to your home directory.
+- **`deskport.clonePath`** — base directory on the **local machine** where
+  remote workspaces are mirrored. Each launch lands under
+  `<clonePath>/<ssh-host>/<absolute-remote-path>/`, so the same remote folder
+  always maps to the same local path regardless of which parent directory you
+  opened in VSCode. Empty (the default) means `~/.deskport-mirrors`; a leading
+  `~` expands to your home directory.
 
 Because it is a local path, set it once in **User** settings to apply
 everywhere, or override it per project in **Workspace** settings — VSCode

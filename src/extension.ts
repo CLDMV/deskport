@@ -27,11 +27,50 @@ import * as vscode from "vscode";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readdir, rm, stat as statLocal, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 
-const DEFAULT_EXCLUDES = ["node_modules", ".git", "out", "dist", "release"];
+/**
+ * Directory segments skipped by default during sync. Always applied; the
+ * config's own `excludes` list is added to these rather than replacing them,
+ * so a user can't accidentally lose `node_modules` etc. by listing one extra
+ * entry.
+ */
+const DEFAULT_EXCLUDES = [
+	"node_modules",
+	".git",
+	"out",
+	"dist",
+	"release",
+	"__tests__",
+	"docs",
+	"examples",
+	"screenshots"
+];
+/**
+ * Filename globs skipped by default during sync (docs / changelogs / test
+ * scaffolding / lockfiles — none of which the runtime needs). Matched against
+ * each file's basename, not its full path. Like {@link DEFAULT_EXCLUDES},
+ * always applied — the config's `excludeFiles` is additive.
+ *
+ * A target's `includeFiles` overrides this — useful when an app actually
+ * needs e.g. a `README.md` at runtime.
+ */
+const DEFAULT_FILE_EXCLUDES = [
+	"*.md",
+	"*.markdown",
+	"*.txt",
+	"*.log",
+	"*.test.*",
+	"*.spec.*",
+	"*.lock",
+	"LICENSE",
+	"LICENSE.*",
+	"CHANGELOG",
+	"CHANGELOG.*"
+];
 const CONFIG_REL = ".deskport/config.json";
 const TRIGGER_MJS_REL = ".deskport/trigger.mjs";
+const GITIGNORE_REL = ".gitignore";
 /** Skip a re-copy when local size matches and mtime is within this window. */
 const MTIME_TOLERANCE_MS = 2000;
 /** Max characters of a process's output kept for error reporting. */
@@ -49,12 +88,42 @@ interface TargetConfig {
 }
 
 interface LauncherConfig {
-	/** Subdirectory name under the clone path. Honored only in the ROOT config. */
-	mirrorName?: string;
 	/** Command run once, in this config's folder, before its first target launches. */
 	install?: string;
-	/** Path segments to skip when mirroring. Honored only in the ROOT config. */
+	/**
+	 * Directory segments to skip when mirroring this scope (additive — added to
+	 * the always-on {@link DEFAULT_EXCLUDES}). Matched against single path
+	 * segments; supports `*` wildcards.
+	 */
 	excludes?: string[];
+	/**
+	 * Filename globs to skip when mirroring this scope (additive — added to
+	 * the always-on {@link DEFAULT_FILE_EXCLUDES}). A glob without `/` is
+	 * matched against the basename; one containing `/` is matched against the
+	 * scope-relative path. Supports `*`, `**`, and `?`.
+	 */
+	excludeFiles?: string[];
+	/**
+	 * Globs that force a file to be included even when {@link excludeFiles} or
+	 * `.gitignore` would otherwise skip it (segment-level `excludes` still
+	 * apply — to bring back a whole directory, list it explicitly here as a
+	 * path, e.g. `"docs/**"`).
+	 */
+	includeFiles?: string[];
+	/**
+	 * Extra paths to mirror alongside this config's folder, resolved relative
+	 * to this config's folder (`..` allowed; must stay inside the workspace).
+	 * Each extra lands at its natural remote-absolute mirror path so a target
+	 * can keep its real relative imports, e.g. `["../shared-lib"]` lets the
+	 * package's source still `import "../shared-lib"`.
+	 */
+	include?: string[];
+	/**
+	 * Whether to honor a `.gitignore` at this scope's root when picking files
+	 * to mirror. Defaults to `true`. Negation patterns (`!keep.me`) are not
+	 * supported yet — use `includeFiles` for force-includes.
+	 */
+	respectGitignore?: boolean;
 	targets: Record<string, TargetConfig>;
 }
 
@@ -116,10 +185,42 @@ let busyText: string | undefined;
 let lastTriggerNonce: number | undefined;
 let watchers: vscode.Disposable[] = [];
 let syncWatcher: vscode.FileSystemWatcher | undefined;
-/** Whether the whole repo has been mirrored in the current launch session. */
-let mirrorSynced = false;
+/**
+ * One scope's effective filter — the compiled `.gitignore` rules plus the
+ * file-level globs the scope was synced with. Kept around after the cold sync
+ * so the live FS watcher can apply the same filtering to incremental changes.
+ */
+interface ScopeFilter {
+	ignoreRules: IgnoreRule[];
+	/** {@link DEFAULT_FILE_EXCLUDES} merged with the config's `excludeFiles`. */
+	excludeFiles: string[];
+	/** The config's `includeFiles`. */
+	includeFiles: string[];
+}
+
+/**
+ * Workspace-relative scopes mirrored in this launch session, keyed by scope
+ * (e.g. a target's `packageRel`, or an extra `include` path). `""` means the
+ * workspace folder itself. Each entry carries the filter the scope was
+ * scanned with — the live FS watcher reuses it so incremental updates apply
+ * the same `.gitignore` and file-exclude rules as the cold sync.
+ *
+ * Each launch re-runs the cold sync for its scopes (the per-file stat-then-
+ * skip optimization makes a no-op revalidation cheap), so missed
+ * `FileSystemWatcher` events — e.g. atomic renames from `sed -i` — are caught
+ * on the next launch rather than leaving the mirror permanently stale.
+ */
+const syncedScopes = new Map<string, ScopeFilter>();
 /** packageRel values whose `install` command has run this session. */
 const installedPackages = new Set<string>();
+/**
+ * Resolved SSH hostnames keyed by VSCode's alias (the `ssh-remote+<alias>`
+ * authority). Computed once per session via `ssh -G <alias>` so two different
+ * `~/.ssh/config` aliases pointing at the same machine produce one mirror
+ * directory, not two. Falls back to the alias itself if `ssh -G` is
+ * unreachable or didn't return a `hostname` line.
+ */
+const resolvedHosts = new Map<string, string>();
 /** Open terminals, keyed by target id — one per target, reused across launches. */
 const terminals = new Map<string, TargetTerminal>();
 
@@ -523,7 +624,7 @@ async function readConfigFile(uri: vscode.Uri, packageRel: string): Promise<void
 	}
 }
 
-/** The workspace-root config, if one exists — it owns mirrorName and excludes. */
+/** The workspace-root config, if one exists — it owns excludes. */
 function rootConfig(): LauncherConfig | undefined {
 	return configs.find((c) => c.packageRel === "")?.config;
 }
@@ -617,16 +718,96 @@ function cloneRoot(): string {
 	return setting;
 }
 
-function mirrorDir(): string {
-	const name = rootConfig()?.mirrorName?.trim() || basename(workspace?.repoPath ?? "") || "devmirror";
-	return join(cloneRoot(), name);
+/** Replace characters unsafe in a local path segment (Windows-strict). */
+function sanitizeSegment(s: string): string {
+	const cleaned = s.replace(/[<>:"\\|?*\x00-\x1f]/g, "_");
+	return cleaned || "_";
 }
 
-function isExcluded(segment: string): boolean {
-	for (const pattern of rootConfig()?.excludes ?? DEFAULT_EXCLUDES) {
+/**
+ * Resolve VSCode's SSH alias to the actual hostname (and port when non-default)
+ * by shelling out to `ssh -G <alias>` on the local machine. This is the same
+ * resolution SSH itself does, so it honors `~/.ssh/config` files, `Include`
+ * directives, `Match` rules, and any other config feature the user has.
+ *
+ * The result is cached for the session — `scopeMirrorDir` then reads it
+ * synchronously. On any failure (no `ssh` on PATH, exit != 0, no `hostname`
+ * line in the output) we cache the alias itself as the fallback, so the worst
+ * case is "no cross-alias dedup" rather than a broken mirror path.
+ */
+function resolveSshHost(alias: string): Promise<string> {
+	const cached = resolvedHosts.get(alias);
+	if (cached !== undefined) return Promise.resolve(cached);
+	return new Promise((resolve) => {
+		let stdout = "";
+		const child = spawn("ssh", ["-G", alias], { env: childEnv() });
+		child.stdout?.on("data", (d: Buffer) => {
+			stdout += d.toString();
+		});
+		const finish = (resolved: string): void => {
+			const safe = sanitizeSegment(resolved);
+			resolvedHosts.set(alias, safe);
+			if (resolved !== alias) output.appendLine(`[deskport] ssh ${alias} → ${resolved}`);
+			resolve(safe);
+		};
+		child.on("error", () => finish(alias));
+		child.on("exit", (code) => {
+			if (code !== 0) return finish(alias);
+			let hostname = "";
+			let port = "";
+			for (const line of stdout.split(/\r?\n/)) {
+				const m = line.trim().match(/^(\S+)\s+(.+)$/);
+				if (!m) continue;
+				const key = m[1]!.toLowerCase();
+				const val = m[2]!;
+				if (key === "hostname" && !hostname) hostname = val;
+				else if (key === "port" && !port) port = val;
+			}
+			if (!hostname) return finish(alias);
+			finish(port && port !== "22" ? `${hostname}_${port}` : hostname);
+		});
+	});
+}
+
+/**
+ * The local folder where one scope of the remote workspace is mirrored.
+ *
+ * The path encodes the **resolved SSH hostname** (via {@link resolveSshHost})
+ * and the **absolute remote path** of the scope's folder, so the same remote
+ * folder always maps to the same local path — regardless of which parent
+ * directory the user happened to open as the workspace, *and* regardless of
+ * which `~/.ssh/config` alias they reached the host through. Two aliases
+ * pointing at the same machine share one mirror.
+ *
+ * `scopeRel` is workspace-relative; `""` means the workspace folder itself.
+ *
+ * Callers must `await resolveSshHost(ws.remote)` once per session before the
+ * first call so the host cache is populated; until then this falls back to
+ * the alias itself so the function stays synchronous (the FS watcher needs
+ * synchronous lookups for routing each file event).
+ */
+function scopeMirrorDir(ws: Workspace, scopeRel: string): string {
+	const trimmedRepo = ws.repoPath.replace(/\/+$/, "");
+	const scopeAbs = scopeRel ? `${trimmedRepo}/${scopeRel}` : trimmedRepo;
+	const parts = scopeAbs.split("/").filter(Boolean).map(sanitizeSegment);
+	const hostDir = ws.remote ? (resolvedHosts.get(ws.remote) ?? sanitizeSegment(ws.remote)) : "local";
+	return join(cloneRoot(), hostDir, ...parts);
+}
+
+/**
+ * Whether a single path segment matches one of `patterns`. Used to skip whole
+ * directories when walking or pruning. The default `patterns` is the always-on
+ * {@link DEFAULT_EXCLUDES}; per-scope sync passes its own combined list.
+ */
+function isExcluded(segment: string, patterns: readonly string[] = DEFAULT_EXCLUDES): boolean {
+	for (const pattern of patterns) {
 		if (pattern.includes("*")) {
-			const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
-			if (re.test(segment)) return true;
+			try {
+				const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$");
+				if (re.test(segment)) return true;
+			} catch {
+				// Bad user pattern — skip it rather than crash the whole walk.
+			}
 		} else if (pattern === segment) {
 			return true;
 		}
@@ -634,12 +815,200 @@ function isExcluded(segment: string): boolean {
 	return false;
 }
 
-/** Copy one remote file into the mirror, skipping it when already up to date. */
-async function mirrorFile(remote: vscode.Uri, localPath: string): Promise<boolean> {
-	const remoteStat = await vscode.workspace.fs.stat(remote);
+/**
+ * Compile one glob (like `*.md`, `docs/**`, or `LICENSE.*`) to a RegExp.
+ *
+ * If the pattern contains `/`, it's matched against the scope-relative path;
+ * otherwise it's matched against the file's basename. Supports `*` (any
+ * characters except `/`), `**` (any characters including `/`), and `?` (any
+ * single non-`/` character). Returns `undefined` if the pattern can't be
+ * compiled.
+ */
+function compileGlob(g: string): { re: RegExp; pathMode: boolean } | undefined {
+	try {
+		const pathMode = g.includes("/");
+		// Escape regex metas including `*` and `?` so subsequent replacements
+		// target their escaped forms (`\*`, `\?`) — otherwise raw `*`/`?` would
+		// reach the RegExp constructor as quantifiers and either error or match
+		// the wrong thing.
+		let re = g.replace(/[.+^${}()|[\]\\*?]/g, "\\$&");
+		// **/x  →  (?:.*/)?x   ;   x/**  →  x(?:/.*)?   ;   **  →  .*
+		re = re.replace(/\\\*\\\*\//g, "(?:.*/)?").replace(/\/\\\*\\\*/g, "(?:/.*)?").replace(/\\\*\\\*/g, ".*");
+		re = re.replace(/\\\*/g, "[^/]*").replace(/\\\?/g, "[^/]");
+		return { re: new RegExp(`^${re}$`), pathMode };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Whether any glob in the list matches the file (by basename or full path). */
+function matchesAnyGlob(globs: readonly string[], name: string, fullRel: string): boolean {
+	for (const g of globs) {
+		const compiled = compileGlob(g);
+		if (!compiled) continue;
+		if (compiled.re.test(compiled.pathMode ? fullRel : name)) return true;
+	}
+	return false;
+}
+
+/** A single rule from a `.gitignore` file, compiled to a regex. */
+interface IgnoreRule {
+	pattern: RegExp;
+	/** True if the original line ended with `/` — matches only directories. */
+	dirOnly: boolean;
+}
+
+/**
+ * Compile one `.gitignore` line to a rule. Returns `undefined` for blank
+ * lines, `#` comments, and negation patterns (`!keep.me` — unsupported here;
+ * users should reach for `includeFiles` to force-include something).
+ */
+function compileIgnore(rawLine: string): IgnoreRule | undefined {
+	let p = rawLine.replace(/\r$/, "");
+	// Trim trailing whitespace but preserve escaped trailing space (rare).
+	p = p.replace(/(?<!\\)\s+$/, "");
+	if (!p || p.startsWith("#") || p.startsWith("!")) return undefined;
+	let dirOnly = false;
+	if (p.endsWith("/")) {
+		dirOnly = true;
+		p = p.slice(0, -1);
+	}
+	// A leading `/` or an internal `/` anchors the pattern to the scope root.
+	let anchored = false;
+	if (p.startsWith("/")) {
+		anchored = true;
+		p = p.slice(1);
+	} else if (p.includes("/")) {
+		anchored = true;
+	}
+	try {
+		// Same escape-then-substitute approach as compileGlob — see its
+		// comment for why `*` and `?` must be in the escape set.
+		let re = p.replace(/[.+^${}()|[\]\\*?]/g, "\\$&");
+		re = re.replace(/\\\*\\\*\//g, "(?:.*/)?").replace(/\/\\\*\\\*/g, "(?:/.*)?").replace(/\\\*\\\*/g, ".*");
+		re = re.replace(/\\\*/g, "[^/]*").replace(/\\\?/g, "[^/]");
+		const final = anchored ? new RegExp(`^${re}(?:/.*)?$`) : new RegExp(`(?:^|.*/)${re}(?:/.*)?$`);
+		return { pattern: final, dirOnly };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Whether any compiled gitignore rule matches a scope-relative path. */
+function isGitignored(rules: readonly IgnoreRule[], rel: string, isDir: boolean): boolean {
+	for (const r of rules) {
+		if (r.dirOnly && !isDir) continue;
+		if (r.pattern.test(rel)) return true;
+	}
+	return false;
+}
+
+/**
+ * Read the `.gitignore` at the root of a remote scope and compile its rules.
+ *
+ * Returns an empty list if the file is missing or unreadable — the
+ * surrounding sync continues as if `.gitignore` was empty rather than failing.
+ */
+async function loadGitignore(remoteRoot: vscode.Uri): Promise<IgnoreRule[]> {
+	try {
+		const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(remoteRoot, GITIGNORE_REL));
+		const text = Buffer.from(bytes).toString("utf8");
+		const rules: IgnoreRule[] = [];
+		for (const line of text.split(/\r?\n/)) {
+			const r = compileIgnore(line);
+			if (r) rules.push(r);
+		}
+		return rules;
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Normalize a workspace-relative path: resolve `.` and `..` segments, drop
+ * duplicate `/`. Returns `".."` if the path escapes the workspace root.
+ */
+function normalizeRel(rel: string): string {
+	const parts = rel.split("/").filter((s) => s && s !== ".");
+	const out: string[] = [];
+	for (const p of parts) {
+		if (p === "..") {
+			if (out.length === 0) return "..";
+			out.pop();
+		} else {
+			out.push(p);
+		}
+	}
+	return out.join("/");
+}
+
+/**
+ * Drop any scope already covered by another scope in the list — used to
+ * collapse overlapping syncs, so we don't sync a child after its parent (the
+ * parent already covers it) and so a per-scope prune can't delete files that
+ * actually belong to a nested scope's mirror.
+ */
+function dedupeScopes(scopes: string[]): string[] {
+	const unique = [...new Set(scopes)].sort((a, b) => a.length - b.length);
+	const kept: string[] = [];
+	for (const s of unique) {
+		const covered = kept.some((k) => k === "" || s === k || s.startsWith(k + "/"));
+		if (!covered) kept.push(s);
+	}
+	return kept;
+}
+
+/**
+ * Resolve a config's `include` array to absolute workspace-relative paths.
+ * Skips entries that would escape the workspace root and logs them.
+ */
+function resolveExtraScopes(extras: readonly string[] | undefined, packageRel: string): string[] {
+	if (!extras) return [];
+	const out: string[] = [];
+	for (const raw of extras) {
+		const combined = packageRel ? `${packageRel}/${raw}` : raw;
+		const normalized = normalizeRel(combined);
+		if (normalized === ".." || normalized.startsWith("../")) {
+			output.appendLine(`[deskport] include "${raw}" escapes workspace root, skipped`);
+			continue;
+		}
+		out.push(normalized);
+	}
+	return out;
+}
+
+/** Build a {@link ScopeFilter} for one scope from its package's config. */
+async function buildScopeFilter(remoteRoot: vscode.Uri, cfg: LauncherConfig | undefined): Promise<ScopeFilter> {
+	const respectGit = cfg?.respectGitignore !== false;
+	const ignoreRules = respectGit ? await loadGitignore(remoteRoot) : [];
+	return {
+		ignoreRules,
+		excludeFiles: [...DEFAULT_FILE_EXCLUDES, ...(cfg?.excludeFiles ?? [])],
+		includeFiles: cfg?.includeFiles ?? []
+	};
+}
+
+/** The effective directory-segment exclude list for a package config. */
+function scopeExcludes(cfg: LauncherConfig | undefined): string[] {
+	return [...DEFAULT_EXCLUDES, ...(cfg?.excludes ?? [])];
+}
+
+/**
+ * Copy one remote file into the mirror, skipping it when already up to date.
+ *
+ * A `remoteStat` may be passed in to reuse a stat the caller already did —
+ * the cold sync pre-stats every file during its scan, so without this we'd
+ * pay a redundant round-trip per file over the SSH bridge.
+ */
+async function mirrorFile(
+	remote: vscode.Uri,
+	localPath: string,
+	remoteStat?: { size: number; mtime: number }
+): Promise<boolean> {
+	const rs = remoteStat ?? (await vscode.workspace.fs.stat(remote));
 	try {
 		const local = await statLocal(localPath);
-		if (local.size === remoteStat.size && Math.abs(local.mtimeMs - remoteStat.mtime) < MTIME_TOLERANCE_MS) {
+		if (local.size === rs.size && Math.abs(local.mtimeMs - rs.mtime) < MTIME_TOLERANCE_MS) {
 			return false;
 		}
 	} catch {
@@ -648,22 +1017,42 @@ async function mirrorFile(remote: vscode.Uri, localPath: string): Promise<boolea
 	const bytes = await vscode.workspace.fs.readFile(remote);
 	await mkdir(dirname(localPath), { recursive: true });
 	await writeFile(localPath, bytes);
-	const mtime = new Date(remoteStat.mtime);
+	const mtime = new Date(rs.mtime);
 	await utimes(localPath, mtime, mtime).catch(() => undefined);
 	return true;
 }
 
-/** Recursively mirror a remote directory into the local mirror. */
-async function mirrorSubtree(remoteDir: vscode.Uri, rel: string, mirror: string, kept?: Set<string>): Promise<number> {
+/**
+ * Recursively mirror a remote directory into the local mirror. Used by the
+ * live sync watcher for incremental updates after the initial cold sync — the
+ * cold sync goes through {@link scanRemote} + a flat copy loop instead, so it
+ * can report real progress and survive per-file failures.
+ */
+async function mirrorSubtree(
+	remoteDir: vscode.Uri,
+	rel: string,
+	mirror: string,
+	excludes: readonly string[],
+	filter: ScopeFilter,
+	kept?: Set<string>
+): Promise<number> {
 	let copied = 0;
 	const entries = await vscode.workspace.fs.readDirectory(remoteDir);
 	for (const [name, type] of entries) {
-		if (isExcluded(name)) continue;
+		if (isExcluded(name, excludes)) continue;
+		// Don't follow symlinks: across an SSH bridge they can point anywhere
+		// (including back into the tree) and aren't something we want to copy.
+		if (type & vscode.FileType.SymbolicLink) continue;
 		const childRel = rel ? `${rel}/${name}` : name;
 		const childRemote = vscode.Uri.joinPath(remoteDir, name);
-		if (type & vscode.FileType.Directory) {
-			copied += await mirrorSubtree(childRemote, childRel, mirror, kept);
-		} else if (type & vscode.FileType.File) {
+		const isDir = !!(type & vscode.FileType.Directory);
+		const isFile = !!(type & vscode.FileType.File);
+		const forced = matchesAnyGlob(filter.includeFiles, name, childRel);
+		if (!forced && isGitignored(filter.ignoreRules, childRel, isDir)) continue;
+		if (isDir) {
+			copied += await mirrorSubtree(childRemote, childRel, mirror, excludes, filter, kept);
+		} else if (isFile) {
+			if (!forced && matchesAnyGlob(filter.excludeFiles, name, childRel)) continue;
 			kept?.add(childRel);
 			if (await mirrorFile(childRemote, join(mirror, childRel))) copied++;
 		}
@@ -671,16 +1060,100 @@ async function mirrorSubtree(remoteDir: vscode.Uri, rel: string, mirror: string,
 	return copied;
 }
 
-/** Delete mirror files that no longer exist remotely. */
-async function pruneMirror(dir: string, rel: string, kept: Set<string>): Promise<number> {
+/** One remote file discovered by {@link scanRemote}: path plus its stat. */
+interface ScannedFile {
+	/** Workspace-relative path. */
+	rel: string;
+	/** Size in bytes — drives the byte-weighted progress bar. */
+	size: number;
+	/** mtime in ms since epoch — passed straight into {@link mirrorFile}. */
+	mtime: number;
+}
+
+/**
+ * Walk the remote tree and stat every file (workspace-relative path + size + mtime).
+ *
+ * Used by the cold sync so it knows the total byte volume *before* it starts
+ * copying — the progress bar then advances by `size / totalBytes` per file
+ * rather than `1 / fileCount`, which matches actual work much better when
+ * file sizes vary wildly. The stats are reused inside {@link mirrorFile}, so
+ * we don't pay an extra round-trip per file vs. the old "stat during copy" path.
+ *
+ * Defensive against symlink loops: tracks every directory URI it enters and
+ * skips repeats. Symlinks themselves are skipped outright (see {@link mirrorSubtree}).
+ */
+async function scanRemote(
+	remoteDir: vscode.Uri,
+	rel: string,
+	files: ScannedFile[],
+	token: vscode.CancellationToken,
+	visited: Set<string>,
+	excludes: readonly string[],
+	filter: ScopeFilter,
+	onProgress: (count: number) => void
+): Promise<void> {
+	if (token.isCancellationRequested) return;
+	const key = remoteDir.toString();
+	if (visited.has(key)) return;
+	visited.add(key);
+	let entries: [string, vscode.FileType][];
+	try {
+		entries = await vscode.workspace.fs.readDirectory(remoteDir);
+	} catch (err) {
+		output.appendLine(`[deskport] scan skipped ${rel || "."}: ${(err as Error).message}`);
+		return;
+	}
+	for (const [name, type] of entries) {
+		if (token.isCancellationRequested) return;
+		if (isExcluded(name, excludes)) continue;
+		if (type & vscode.FileType.SymbolicLink) continue;
+		const childRel = rel ? `${rel}/${name}` : name;
+		const childUri = vscode.Uri.joinPath(remoteDir, name);
+		const isDir = !!(type & vscode.FileType.Directory);
+		const isFile = !!(type & vscode.FileType.File);
+		// `includeFiles` forces a file (or every file under a forced directory)
+		// back in even when a `.gitignore` or the default file-exclude list
+		// would otherwise skip it — segment-level `excludes` still apply.
+		const forced = matchesAnyGlob(filter.includeFiles, name, childRel);
+		if (!forced && isGitignored(filter.ignoreRules, childRel, isDir)) continue;
+		if (isDir) {
+			await scanRemote(childUri, childRel, files, token, visited, excludes, filter, onProgress);
+		} else if (isFile) {
+			if (!forced && matchesAnyGlob(filter.excludeFiles, name, childRel)) continue;
+			try {
+				const s = await vscode.workspace.fs.stat(childUri);
+				files.push({ rel: childRel, size: s.size, mtime: s.mtime });
+				onProgress(files.length);
+			} catch (err) {
+				output.appendLine(`[deskport] scan stat skipped ${childRel}: ${(err as Error).message}`);
+			}
+		}
+	}
+}
+
+/** Human-readable byte size for progress and log messages. */
+function formatBytes(n: number): string {
+	if (n < 1024) return `${n} B`;
+	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+	if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+	return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+/** Delete mirror files that no longer exist remotely (within one scope). */
+async function pruneMirror(
+	dir: string,
+	rel: string,
+	kept: Set<string>,
+	excludes: readonly string[]
+): Promise<number> {
 	let removed = 0;
 	const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
 	for (const entry of entries) {
-		if (isExcluded(entry.name)) continue;
+		if (isExcluded(entry.name, excludes)) continue;
 		const childRel = rel ? `${rel}/${entry.name}` : entry.name;
 		const childPath = join(dir, entry.name);
 		if (entry.isDirectory()) {
-			removed += await pruneMirror(childPath, childRel, kept);
+			removed += await pruneMirror(childPath, childRel, kept, excludes);
 		} else if (entry.isFile() && !kept.has(childRel)) {
 			await rm(childPath, { force: true });
 			removed++;
@@ -689,11 +1162,109 @@ async function pruneMirror(dir: string, rel: string, kept: Set<string>): Promise
 	return removed;
 }
 
-async function syncAll(ws: Workspace, mirror: string): Promise<void> {
-	const kept = new Set<string>();
-	const copied = await mirrorSubtree(ws.folder.uri, "", mirror, kept);
-	const removed = await pruneMirror(mirror, "", kept);
-	output.appendLine(`[deskport] mirror ready — ${copied} file(s) updated, ${removed} removed`);
+/** Whether a cold sync ran to completion or the user cancelled it. */
+type SyncResult = "ok" | "cancelled";
+
+/** One subtree the cold sync should mirror, with the filters that apply to it. */
+interface SyncJob {
+	/** Workspace-relative scope path; `""` for the workspace root. */
+	scope: string;
+	/** Scope-relative source: a workspace folder + the scope path. */
+	remoteRoot: vscode.Uri;
+	/** Local folder this subtree mirrors into. */
+	localRoot: string;
+	/** Short label for progress/log messages. */
+	label: string;
+	/** Segment-level dir excludes for this scope ({@link DEFAULT_EXCLUDES} + config). */
+	excludes: string[];
+	/** File-level filter for this scope. */
+	filter: ScopeFilter;
+}
+
+/**
+ * Cold-sync one or more remote subtrees into their local mirror folders,
+ * driving a single byte-weighted progress bar across the whole set.
+ *
+ * Each job is treated as a self-contained subtree with its own filters
+ * (`.gitignore`, segment excludes, file globs, force-includes). The function
+ * first scans every job to compute a grand total of bytes, then copies in a
+ * second pass so the progress bar reflects real work across the combined set
+ * rather than resetting per-job.
+ *
+ * The work splits into three reported phases per job (with shared bar):
+ *   1. `scanning` — walk the remote subtree to gather paths + sizes.
+ *   2. `syncing N/M` — copy/refresh each file; per-file errors are logged
+ *      to the output channel but do not abort the whole sync.
+ *   3. `removing stale files…` — drop locally-mirrored files that no longer
+ *      exist remotely inside that subtree.
+ */
+async function syncAll(
+	jobs: SyncJob[],
+	progress: vscode.Progress<{ message?: string; increment?: number }>,
+	token: vscode.CancellationToken
+): Promise<SyncResult> {
+	type ScannedJob = SyncJob & { files: ScannedFile[]; totalBytes: number };
+	const scanned: ScannedJob[] = [];
+	for (const job of jobs) {
+		progress.report({ message: `scanning ${job.label}…` });
+		output.appendLine(`[deskport] scanning ${job.label}…`);
+		const files: ScannedFile[] = [];
+		let lastScanReport = 0;
+		await scanRemote(job.remoteRoot, "", files, token, new Set<string>(), job.excludes, job.filter, (count) => {
+			const now = Date.now();
+			if (now - lastScanReport >= 200) {
+				progress.report({ message: `scanning ${job.label} — ${count} files found…` });
+				lastScanReport = now;
+			}
+		});
+		if (token.isCancellationRequested) return "cancelled";
+		const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+		output.appendLine(`[deskport] scan found ${files.length} file(s) in ${job.label}, ${formatBytes(totalBytes)}`);
+		scanned.push({ ...job, files, totalBytes });
+	}
+
+	const grandFiles = scanned.reduce((a, j) => a + j.files.length, 0);
+	const grandBytes = scanned.reduce((a, j) => a + j.totalBytes, 0);
+	let processedFiles = 0;
+	let copied = 0;
+	let skipped = 0;
+	let failed = 0;
+	const fallbackStep = grandFiles > 0 ? 100 / grandFiles : 0;
+	for (const j of scanned) {
+		const kept = new Set<string>();
+		for (const f of j.files) {
+			if (token.isCancellationRequested) return "cancelled";
+			kept.add(f.rel);
+			const remote = vscode.Uri.joinPath(j.remoteRoot, ...f.rel.split("/").filter(Boolean));
+			const localPath = join(j.localRoot, f.rel);
+			try {
+				if (await mirrorFile(remote, localPath, { size: f.size, mtime: f.mtime })) copied++;
+				else skipped++;
+			} catch (err) {
+				failed++;
+				output.appendLine(`[deskport] failed to mirror ${j.label}/${f.rel}: ${(err as Error).message}`);
+			}
+			processedFiles++;
+			const step = grandBytes > 0 ? (f.size / grandBytes) * 100 : fallbackStep;
+			progress.report({
+				increment: step,
+				message: `${processedFiles}/${grandFiles} files — ${j.label}/${f.rel}`
+			});
+		}
+		if (token.isCancellationRequested) return "cancelled";
+		progress.report({ message: `removing stale files in ${j.label}…` });
+		let removed = 0;
+		try {
+			removed = await pruneMirror(j.localRoot, "", kept, j.excludes);
+		} catch (err) {
+			output.appendLine(`[deskport] prune failed in ${j.label}: ${(err as Error).message}`);
+		}
+		output.appendLine(
+			`[deskport] mirror ready (${j.label}) — ${copied} updated, ${skipped} unchanged, ${removed} removed` +
+				(failed > 0 ? `, ${failed} failed (see output above)` : "")
+		);
+	}
+	return "ok";
 }
 
 function ensureSyncWatcher(): void {
@@ -709,12 +1280,52 @@ function stopSyncWatcher(): void {
 	syncWatcher = undefined;
 }
 
+/**
+ * The synced scope that owns a workspace-relative path, or `undefined` if
+ * nothing covers it. When several synced scopes nest, prefer the deepest one
+ * (longest match) — that's the smallest local mirror dir that still contains
+ * the file, so its rel-to-scope path is shortest.
+ */
+function owningScope(rel: string): string | undefined {
+	let best: string | undefined;
+	for (const scope of syncedScopes.keys()) {
+		if (scope === "" || rel === scope || rel.startsWith(scope + "/")) {
+			if (best === undefined || scope.length > best.length) best = scope;
+		}
+	}
+	return best;
+}
+
 async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<void> {
 	if (!workspace) return;
+	const ws = workspace;
 	const rel = vscode.workspace.asRelativePath(uri, false);
-	if (rel.split("/").some(isExcluded)) return;
+	// The FS watcher fires for the whole workspace, but each scope mirrors to
+	// its own local folder — route the event into the owning scope's dir, and
+	// ignore events that fall outside every cold-synced scope.
+	const scope = owningScope(rel);
+	if (scope === undefined) return;
+	const filter = syncedScopes.get(scope);
+	if (!filter) return;
+	// Reuse the scope's filters so live updates obey the same `.gitignore` /
+	// file-exclude rules as the cold sync that produced this mirror.
+	const relInScope = scope === "" ? rel : rel.slice(scope.length + 1);
+	const segments = relInScope ? relInScope.split("/") : [];
+	const cfg = configs.find((c) => c.packageRel === scope)?.config;
+	const excludes = scopeExcludes(cfg);
+	if (segments.some((seg) => isExcluded(seg, excludes))) return;
+	const name = segments[segments.length - 1] ?? "";
+	const forced = matchesAnyGlob(filter.includeFiles, name, relInScope);
+	if (!forced) {
+		if (kind === "upsert" && matchesAnyGlob(filter.excludeFiles, name, relInScope)) return;
+		// Use isDir=false because the watcher fires per file; if a directory
+		// matches a gitignore rule, its children's paths will also match the
+		// same rule (or a prefix of it).
+		if (isGitignored(filter.ignoreRules, relInScope, false)) return;
+	}
 
-	const localPath = join(mirrorDir(), rel);
+	const scopeDir = scopeMirrorDir(ws, scope);
+	const localPath = relInScope ? join(scopeDir, relInScope) : scopeDir;
 	try {
 		if (kind === "delete") {
 			await rm(localPath, { recursive: true, force: true });
@@ -722,7 +1333,7 @@ async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<
 		}
 		const remoteStat = await vscode.workspace.fs.stat(uri);
 		if (remoteStat.type & vscode.FileType.Directory) {
-			await mirrorSubtree(uri, rel, mirrorDir());
+			await mirrorSubtree(uri, relInScope, scopeDir, excludes, filter);
 		} else {
 			await mirrorFile(uri, localPath);
 		}
@@ -794,36 +1405,81 @@ async function launchTarget(id: string): Promise<void> {
 	output.appendLine("");
 	output.appendLine(`[deskport] launch ${JSON.stringify(id)}`);
 
-	// Where the target runs: <base>/<package folder>/<target cwd>.
-	const relFromRoot = joinRel(rt.packageRel, rt.target.cwd?.trim() || ".");
-
 	// Sync + install run inside a progress notification. The result is the
-	// directory to run from, or undefined when a step failed (already reported).
+	// directory to run from, or undefined when a step failed (already reported)
+	// or the user cancelled the launch.
 	const runCwd = await vscode.window.withProgress(
-		{ location: vscode.ProgressLocation.Notification, title: `DeskPort: launching ${rt.key}`, cancellable: false },
-		async (progress): Promise<string | undefined> => {
+		{ location: vscode.ProgressLocation.Notification, title: `DeskPort: launching ${rt.key}`, cancellable: true },
+		async (progress, token): Promise<string | undefined> => {
+			const targetCwdRel = rt.target.cwd?.trim() || ".";
 			if (ws.remote === null) {
-				const cwd = join(ws.repoPath, relFromRoot);
+				const cwd = join(ws.repoPath, rt.packageRel, targetCwdRel);
 				output.appendLine(`[deskport] local repo: ${cwd}`);
 				return cwd;
 			}
-			const mirror = mirrorDir();
-			const cwd = join(mirror, relFromRoot);
+			// Resolve the SSH alias to the actual hostname before computing any
+			// mirror path, so a single physical host always maps to a single
+			// local mirror dir even if reached through multiple `~/.ssh/config`
+			// aliases. Cheap after the first call (cached for the session).
+			await resolveSshHost(ws.remote);
 
-			// Cold start: mirror the whole repo once per launch session.
-			if (!mirrorSynced) {
-				output.appendLine(`[deskport] remote: ${ws.remote}:${ws.repoPath}`);
-				output.appendLine(`[deskport] mirror: ${mirror}`);
-				progress.report({ message: "syncing repo to this machine…" });
-				setBusy("syncing");
-				try {
-					await mkdir(mirror, { recursive: true });
-					await syncAll(ws, mirror);
-				} catch (err) {
-					failLaunch(`initial sync failed: ${(err as Error).message}`);
+			// Scope the cold sync to this target's package folder, not the whole
+			// workspace, and (optionally) to extra paths listed in the config's
+			// `include` so a cross-package monorepo can pull sibling libs the
+			// runtime needs. Each scope mirrors at its natural remote-abs path,
+			// so relative imports keep working.
+			const primaryScope = rt.packageRel;
+			const packageDir = scopeMirrorDir(ws, primaryScope);
+			const cwd = join(packageDir, targetCwdRel);
+			const scopes = dedupeScopes([primaryScope, ...resolveExtraScopes(rt.pkg.config.include, primaryScope)]);
+
+			const buildJob = async (scope: string): Promise<SyncJob> => {
+				const segments = scope.split("/").filter(Boolean);
+				const remoteRoot =
+					segments.length > 0 ? vscode.Uri.joinPath(ws.folder.uri, ...segments) : ws.folder.uri;
+				const localRoot = scopeMirrorDir(ws, scope);
+				await mkdir(localRoot, { recursive: true });
+				// Each scope reads its own root .gitignore — extras are typically
+				// separate packages with their own ignore rules.
+				const filter = await buildScopeFilter(remoteRoot, rt.pkg.config);
+				return {
+					scope,
+					remoteRoot,
+					localRoot,
+					label: scope || ".",
+					excludes: scopeExcludes(rt.pkg.config),
+					filter
+				};
+			};
+
+			// Always re-run the cold sync — the per-file `stat`-then-skip path
+			// makes a no-op revalidation cheap, and it's the only thing that
+			// catches changes the live watcher missed (e.g. atomic-rename
+			// updates from `sed -i` that don't fire a usable watcher event).
+			const remoteAbs = primaryScope ? `${ws.repoPath.replace(/\/+$/, "")}/${primaryScope}` : ws.repoPath;
+			output.appendLine(`[deskport] remote: ${ws.remote}:${remoteAbs}`);
+			output.appendLine(`[deskport] mirror: ${packageDir}`);
+			if (scopes.length > 1) output.appendLine(`[deskport] scopes: ${scopes.map((s) => s || ".").join(", ")}`);
+			setBusy("syncing");
+			try {
+				const jobs: SyncJob[] = [];
+				for (const scope of scopes) jobs.push(await buildJob(scope));
+				const result = await syncAll(jobs, progress, token);
+				if (result === "cancelled") {
+					output.appendLine("[deskport] sync cancelled");
 					return undefined;
 				}
-				mirrorSynced = true;
+				for (const j of jobs) syncedScopes.set(j.scope, j.filter);
+			} catch (err) {
+				const e = err as Error;
+				if (e.stack) output.appendLine(e.stack);
+				failLaunch(`initial sync failed: ${e.message}`);
+				return undefined;
+			}
+
+			if (token.isCancellationRequested) {
+				output.appendLine("[deskport] launch cancelled");
+				return undefined;
 			}
 
 			// Per-package install, lazily on this package's first launch.
@@ -832,12 +1488,17 @@ async function launchTarget(id: string): Promise<void> {
 				progress.report({ message: `installing dependencies — ${installCmd}` });
 				setBusy(`installing ${rt.packageRel || "."}`);
 				output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
-				const install = await runShell(installCmd, join(mirror, rt.packageRel));
+				const install = await runShell(installCmd, packageDir);
 				if (!install.ok) {
 					failLaunch(`install failed: ${installCmd}`, install.tail);
 					return undefined;
 				}
 				installedPackages.add(rt.packageRel);
+			}
+
+			if (token.isCancellationRequested) {
+				output.appendLine("[deskport] launch cancelled");
+				return undefined;
 			}
 
 			await mkdir(cwd, { recursive: true });
@@ -974,7 +1635,7 @@ function onActiveChange(): void {
 	if (!anyRunning()) {
 		// No process running: drop the live mirror; re-sync/-install next launch.
 		stopSyncWatcher();
-		mirrorSynced = false;
+		syncedScopes.clear();
 		installedPackages.clear();
 	}
 	updateStatus();
