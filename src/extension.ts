@@ -37,6 +37,8 @@ import { dirname, join } from "node:path";
  */
 const DEFAULT_EXCLUDES = [
 	"node_modules",
+	".pnpm-store",
+	".pnpm",
 	".git",
 	"out",
 	"dist",
@@ -173,6 +175,8 @@ interface TargetTerminal {
 }
 
 let extensionUri: vscode.Uri;
+/** This extension's version, read from its manifest at activation. */
+let extensionVersion = "";
 let output: vscode.OutputChannel;
 let statusItem: vscode.StatusBarItem;
 let targetsProvider: TargetsViewProvider;
@@ -371,8 +375,10 @@ button.stop:hover { background: var(--vscode-button-secondaryHoverBackground); }
 .empty { padding: 16px 12px; color: var(--vscode-descriptionForeground); }
 .empty button { margin-top: 10px; }
 .err { padding: 8px 12px; color: var(--vscode-errorForeground); font-size: .92em; }
+.foot { padding: 6px 12px; color: var(--vscode-descriptionForeground); font-size: .85em; border-top: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,.18)); }
 </style></head><body>
 <div id="root"></div>
+<div class="foot">DeskPort${extensionVersion ? " v" + extensionVersion : ""}</div>
 <script nonce="${n}">
 const api = acquireVsCodeApi();
 const ROCKET = ${JSON.stringify(rocketSvg)};
@@ -481,8 +487,9 @@ class TargetsViewProvider implements vscode.WebviewViewProvider {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	extensionUri = context.extensionUri;
+	extensionVersion = (context.extension.packageJSON as { version?: string }).version ?? "";
 	output = vscode.window.createOutputChannel("DeskPort");
-	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+	statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	statusItem.command = "deskport.menu";
 	targetsProvider = new TargetsViewProvider();
 
@@ -498,6 +505,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		output,
 		statusItem,
 		vscode.commands.registerCommand("deskport.menu", showMenu),
+		vscode.commands.registerCommand("deskport.refresh", refresh),
 		vscode.commands.registerCommand("deskport.init", initProject),
 		vscode.commands.registerCommand("deskport.launch", (id: string) => launchTarget(id)),
 		vscode.commands.registerCommand("deskport.stop", (id: string) => stopTarget(id)),
@@ -1642,8 +1650,57 @@ function onActiveChange(): void {
 }
 
 /** Reveal the DeskPort "Targets" panel (the status bar item's click action). */
+/**
+ * The status-bar click action — a QuickPick listing every target, grouped by
+ * package. Unlike the hover tooltip (which VSCode renders at full height), a
+ * QuickPick is natively scrollable and type-to-filter, so it stays usable when
+ * a workspace defines a TON of targets. Selecting a target launches it (or
+ * stops it, if already running).
+ */
 async function showMenu(): Promise<void> {
-	await vscode.commands.executeCommand("deskport.targets.focus");
+	const targets = allTargets();
+	if (targets.length === 0) {
+		// Nothing to launch yet — send the user to the panel, which offers Init.
+		await vscode.commands.executeCommand("deskport.targets.focus");
+		return;
+	}
+
+	interface MenuItem extends vscode.QuickPickItem {
+		id?: string;
+		running?: boolean;
+	}
+	const items: MenuItem[] = [];
+	let lastPkg: string | undefined;
+	for (const rt of targets) {
+		const pkgLabel = rt.packageRel || "workspace root";
+		if (pkgLabel !== lastPkg) {
+			items.push({ label: pkgLabel, kind: vscode.QuickPickItemKind.Separator });
+			lastPkg = pkgLabel;
+		}
+		const running = terminals.get(rt.id)?.child !== undefined;
+		items.push({
+			label: `$(${running ? "debug-stop" : "rocket"}) ${rt.target.label ?? rt.key}`,
+			description: running ? "running — select to stop" : rt.target.command,
+			id: rt.id,
+			running
+		});
+	}
+
+	const pick = await vscode.window.showQuickPick(items, {
+		title: "DeskPort — launch a dev target on this machine",
+		placeHolder: "Select a target to launch or stop",
+		matchOnDescription: true
+	});
+	if (!pick?.id) return;
+	if (pick.running) stopTarget(pick.id);
+	else await launchTarget(pick.id);
+}
+
+/** Re-scan the workspace for `.deskport/config.json` files and repaint the UI. */
+async function refresh(): Promise<void> {
+	await loadConfigs();
+	registerWatchers();
+	updateStatus();
 }
 
 async function initProject(): Promise<void> {
@@ -1705,29 +1762,54 @@ function commandUri(command: string, arg?: string): string {
  * package; clicking one runs deskport.launch / deskport.stop directly, so the
  * hover doubles as the launch menu (no top-of-window QuickPick needed).
  */
+/**
+ * Largest number of target links the hover lists inline. VSCode renders a
+ * status-bar tooltip at its full content height with no scrollbar, so an
+ * unbounded list runs off-screen when a workspace defines a TON of targets.
+ * Past this cap the hover shows a "+N more" link into the (scrollable) panel;
+ * the searchable QuickPick (click the item) is the full launcher.
+ */
+const TOOLTIP_TARGET_CAP = 15;
+
 function buildTooltip(): vscode.MarkdownString {
 	const md = new vscode.MarkdownString(undefined, true);
-	md.isTrusted = { enabledCommands: ["deskport.launch", "deskport.stop", "deskport.init"] };
+	md.isTrusted = {
+		enabledCommands: ["deskport.launch", "deskport.stop", "deskport.init", "deskport.menu", "deskport.refresh", "deskport.targets.focus"]
+	};
+	const ver = extensionVersion ? ` v${extensionVersion}` : "";
 
 	if (busyText) {
-		md.appendMarkdown(`$(sync~spin) **DeskPort** — ${busyText}…`);
+		md.appendMarkdown(`$(sync~spin) **DeskPort**${ver} — ${busyText}…`);
 		return md;
 	}
 	if (configs.length === 0) {
 		if (configErrors.length > 0) {
+			md.appendMarkdown(`**DeskPort**${ver}\n\n`);
 			md.appendMarkdown(configErrors.map((e) => `$(error) ${e}`).join("\n\n"));
 		} else {
-			md.appendMarkdown("**DeskPort**\n\n");
+			md.appendMarkdown(`**DeskPort**${ver}\n\n`);
 			md.appendMarkdown(`[$(add) Initialize .deskport/ in this project](${commandUri("deskport.init")})`);
 		}
+		md.appendMarkdown(`\n\n[$(refresh) Refresh](${commandUri("deskport.refresh")})`);
 		return md;
 	}
 
-	md.appendMarkdown("**DeskPort** — launch a dev target on this machine");
+	md.appendMarkdown(`**DeskPort**${ver} — launch a dev target on this machine`);
+	const total = allTargets().length;
+	let shown = 0;
+	let truncated = false;
 	for (const pkg of configs) {
+		if (shown >= TOOLTIP_TARGET_CAP) {
+			truncated = true;
+			break;
+		}
 		md.appendMarkdown(`\n\n**${pkg.packageRel || "workspace root"}**\n\n`);
 		const lines: string[] = [];
 		for (const [key, t] of Object.entries(pkg.config.targets)) {
+			if (shown >= TOOLTIP_TARGET_CAP) {
+				truncated = true;
+				break;
+			}
 			const id = targetId(pkg.packageRel, key);
 			const label = t.label ?? key;
 			const running = terminals.get(id)?.child !== undefined;
@@ -1736,12 +1818,21 @@ function buildTooltip(): vscode.MarkdownString {
 					? `$(debug-stop) [Stop “${label}”](${commandUri("deskport.stop", id)})`
 					: `$(rocket) [${label}](${commandUri("deskport.launch", id)})`
 			);
+			shown++;
 		}
 		md.appendMarkdown(lines.join("\n\n"));
+	}
+	if (truncated) {
+		md.appendMarkdown(
+			`\n\n[$(list-flat) +${total - shown} more — open the panel](${commandUri("deskport.targets.focus")})`
+		);
 	}
 	if (configErrors.length > 0) {
 		md.appendMarkdown(`\n\n${configErrors.map((e) => `$(warning) ${e}`).join("\n\n")}`);
 	}
+	md.appendMarkdown(
+		`\n\n[$(list-selection) All targets…](${commandUri("deskport.menu")})  ·  [$(refresh) Refresh](${commandUri("deskport.refresh")})`
+	);
 	return md;
 }
 
