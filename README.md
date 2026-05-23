@@ -64,6 +64,22 @@ writes two files under `.deskport/`:
 
 Add `.deskport/trigger.json` to your `.gitignore` — it is runtime state.
 
+## pnpm monorepos
+
+If a target's package belongs to a pnpm workspace, scoping the sync to that one package folder isn't enough — pnpm resolves `workspace:*` dependencies at the **workspace root** (`pnpm-workspace.yaml` + the lockfile + a single hoisted store), so installing inside an isolated package can't link its sibling packages.
+
+DeskPort handles this automatically. Before launching, it walks **up** from the target's package looking for a `pnpm-workspace.yaml` (the same way pnpm finds its root). When it finds one, it treats that directory as the workspace root and mirrors:
+
+- the root manifests — `pnpm-workspace.yaml`, `pnpm-lock.yaml`, the root `package.json`, `.npmrc`, `.pnpmfile.cjs`;
+- the target package itself;
+- every `workspace:*` dependency package the target needs, resolved transitively from each `package.json`.
+
+It then runs `install` from that root, so pnpm builds the dependency links correctly. A bare `pnpm install` is automatically scoped to the launched package and its dependencies (`pnpm install --filter "<name>..."`); a custom `install` command runs as written. The target then runs from its own package folder, with `node_modules` linked as pnpm intends.
+
+The discovered root may sit **above** the folder you opened in VSCode, so opening a single package of a larger monorepo works — DeskPort reaches up to the real root regardless. How far up it looks is controlled by `deskport.workspaceMaxHeight` (default 5; see [Settings](#settings)); a per-package `"workspaceMaxHeight"` in `config.json` overrides it, and `0` disables the walk. If no `pnpm-workspace.yaml` is found within the cap, DeskPort just syncs the target's own folder as usual.
+
+If the resolver misses a dependency (an unusual layout, a catalog reference, a runtime-only path import), list the extra package folder(s) under `include` — they're mirrored alongside the auto-resolved set.
+
 ## Launch a target
 
 **From the status bar** — click **🚀 DeskPort** and pick a target. Running
@@ -95,6 +111,10 @@ Open **Settings** and search for "DeskPort":
   always maps to the same local path regardless of which parent directory you
   opened in VSCode. Empty (the default) means `~/.deskport-mirrors`; a leading
   `~` expands to your home directory.
+- **`deskport.workspaceMaxHeight`** — how many directory levels DeskPort walks
+  up from a target's package looking for a `pnpm-workspace.yaml` (default `5`).
+  See [pnpm monorepos](#pnpm-monorepos). Set to `0` to disable the walk-up; a
+  per-package `"workspaceMaxHeight"` in `.deskport/config.json` overrides it.
 
 Because it is a local path, set it once in **User** settings to apply
 everywhere, or override it per project in **Workspace** settings — VSCode

@@ -2,7 +2,7 @@
 	"name": "deskport",
 	"displayName": "DeskPort",
 	"description": "Sync an SSH-remote workspace to your local machine and launch configured dev targets — for Electron and other GUI apps that must run where the display is.",
-	"version": "0.8.2",
+	"version": "0.9.4",
 	"publisher": "cldmv",
 	"icon": "resources/logo.png",
 	"license": "Apache-2.0",
@@ -110,6 +110,13 @@
 					"default": "",
 					"scope": "window",
 					"markdownDescription": "Base directory on the **local machine** where remote workspaces are mirrored (cloned). Each launch lands under `<clonePath>/<ssh-host>/<absolute-remote-path>/`, so the same remote folder always maps to the same local path regardless of which parent directory you opened in VSCode.\n\nLeave empty to use the default `~/.deskport-mirrors`. A leading `~` expands to your home directory. Because this is a local filesystem path, it can be set globally in **User** settings or overridden per project in **Workspace** settings."
+				},
+				"deskport.workspaceMaxHeight": {
+					"type": "number",
+					"default": 5,
+					"minimum": 0,
+					"scope": "resource",
+					"markdownDescription": "How many directory levels DeskPort walks **up** from a target's package, looking for a `pnpm-workspace.yaml`, before launching.\n\nWhen one is found within this many levels, that directory is treated as the workspace root: DeskPort mirrors the root manifests (`pnpm-workspace.yaml`, `pnpm-lock.yaml`, root `package.json`, `.npmrc`, `.pnpmfile.cjs`), the target package, and the target's `workspace:*` dependency packages (resolved transitively), then runs `install` from that root so pnpm linkage is established correctly. When none is found within the cap, DeskPort falls back to syncing just the target's own folder.\n\nWhen installing at a discovered root, a bare `pnpm install` / `pnpm i` in the package's `install` is automatically scoped to the launched package and its dependencies (`pnpm install --filter \"<name>...\"`); any other `install` command runs verbatim. DeskPort never substitutes a different package manager — the command always comes from your `.deskport/config.json`.\n\nSet to `0` to disable the walk-up entirely. A per-package `\"workspaceMaxHeight\"` in `.deskport/config.json` overrides this setting."
 				}
 			}
 		}

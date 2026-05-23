@@ -73,6 +73,17 @@ const DEFAULT_FILE_EXCLUDES = [
 const CONFIG_REL = ".deskport/config.json";
 const TRIGGER_MJS_REL = ".deskport/trigger.mjs";
 const GITIGNORE_REL = ".gitignore";
+/** The file whose presence marks a pnpm workspace root during the walk-up. */
+const PNPM_WORKSPACE_FILE = "pnpm-workspace.yaml";
+/**
+ * Root-level files a pnpm workspace install needs, mirrored alongside the
+ * target package and its dependency closure (only the ones that actually
+ * exist remotely are copied). The lockfile and workspace manifest let pnpm
+ * resolve `workspace:*` links; `.npmrc` / `.pnpmfile.cjs` carry install config.
+ */
+const PNPM_ROOT_FILES = [PNPM_WORKSPACE_FILE, "pnpm-lock.yaml", "package.json", ".npmrc", ".pnpmfile.cjs"];
+/** Default for `deskport.workspaceMaxHeight` when neither config nor setting sets it. */
+const DEFAULT_WORKSPACE_MAX_HEIGHT = 5;
 /** Skip a re-copy when local size matches and mtime is within this window. */
 const MTIME_TOLERANCE_MS = 2000;
 /** Max characters of a process's output kept for error reporting. */
@@ -126,6 +137,17 @@ interface LauncherConfig {
 	 * supported yet — use `includeFiles` for force-includes.
 	 */
 	respectGitignore?: boolean;
+	/**
+	 * How many directory levels to walk **up** from this config's folder
+	 * looking for a `pnpm-workspace.yaml` before launching a target. When one
+	 * is found within the cap, that directory becomes the workspace root: the
+	 * cold sync mirrors its manifests + this package + the target's
+	 * `workspace:*` dependency closure, and `install` runs from there so pnpm
+	 * linkage resolves. When none is found, only this folder is synced.
+	 *
+	 * Overrides the `deskport.workspaceMaxHeight` setting. `0` disables the walk.
+	 */
+	workspaceMaxHeight?: number;
 	targets: Record<string, TargetConfig>;
 }
 
@@ -185,10 +207,30 @@ let rocketSvg = "";
 let workspace: Workspace | undefined;
 let configs: DiscoveredConfig[] = [];
 let configErrors: string[] = [];
+/**
+ * True while a config-discovery scan is running. Pushed to the sidebar so the
+ * webview can render a "Scanning…" state and to the footer so the indicator
+ * stays visible even after the first config shows up.
+ */
+let scanning = false;
+/** The current in-flight scan, so concurrent {@link loadConfigs} calls share one pass. */
+let scanInFlight: Promise<void> | undefined;
+/** Set while a scan is running if another caller asks for a re-scan; triggers a follow-up pass. */
+let rescanNeeded = false;
 let busyText: string | undefined;
+/**
+ * Target id currently in its sync/install/spawn handoff, so the sidebar can
+ * show a per-target "launching…" state in the gap between the click and the
+ * actual spawn. Cleared from {@link startProcess} once the child is set, or
+ * from {@link launchTarget} when the run is cancelled or fails before spawn.
+ * Only one launch runs at a time (the {@link busyText} guard enforces this),
+ * so a single id is enough.
+ */
+let launchingId: string | undefined;
 let lastTriggerNonce: number | undefined;
 let watchers: vscode.Disposable[] = [];
-let syncWatcher: vscode.FileSystemWatcher | undefined;
+/** Live FS watchers — one (or, for a files-only scope, one per file) per active scope. */
+let syncWatchers: vscode.FileSystemWatcher[] = [];
 /**
  * One scope's effective filter — the compiled `.gitignore` rules plus the
  * file-level globs the scope was synced with. Kept around after the cold sync
@@ -203,18 +245,18 @@ interface ScopeFilter {
 }
 
 /**
- * Workspace-relative scopes mirrored in this launch session, keyed by scope
- * (e.g. a target's `packageRel`, or an extra `include` path). `""` means the
- * workspace folder itself. Each entry carries the filter the scope was
- * scanned with — the live FS watcher reuses it so incremental updates apply
- * the same `.gitignore` and file-exclude rules as the cold sync.
+ * Every scope mirrored by a currently-running launch, keyed by {@link jobKey}.
+ * A scope's {@link SyncJob} carries its remote root, local mirror dir, and the
+ * filters it was scanned with — the live FS watcher rebuilds one watcher per
+ * job from this map so incremental updates obey the same rules as the cold
+ * sync, and concurrent targets contribute the union of their scopes.
  *
  * Each launch re-runs the cold sync for its scopes (the per-file stat-then-
  * skip optimization makes a no-op revalidation cheap), so missed
  * `FileSystemWatcher` events — e.g. atomic renames from `sed -i` — are caught
  * on the next launch rather than leaving the mirror permanently stale.
  */
-const syncedScopes = new Map<string, ScopeFilter>();
+const activeJobs = new Map<string, SyncJob>();
 /** packageRel values whose `install` command has run this session. */
 const installedPackages = new Set<string>();
 /**
@@ -229,10 +271,11 @@ const resolvedHosts = new Map<string, string>();
 const terminals = new Map<string, TargetTerminal>();
 
 /** The run state of a target, shown in the sidebar. */
-type TargetStatus = "idle" | "running" | "exited" | "failed" | "stopped";
+type TargetStatus = "idle" | "launching" | "running" | "exited" | "failed" | "stopped";
 
 /** Derive a target's status from its terminal and most recent exit. */
 function targetStatus(id: string): TargetStatus {
+	if (launchingId === id) return "launching";
 	const tt = terminals.get(id);
 	if (!tt) return "idle";
 	if (tt.child) return "running";
@@ -242,14 +285,37 @@ function targetStatus(id: string): TargetStatus {
 	return "failed";
 }
 
-/** A target's status as text — `failed` carries its exit code. */
+/**
+ * The active sub-phase of a "launching" target, derived from {@link busyText}.
+ * Lets the sidebar button read "Syncing…" / "Installing…" instead of a static
+ * "Launching…" across the whole pre-spawn handoff. The busyText values are the
+ * ones {@link launchTarget} passes to {@link setBusy} during the launch.
+ */
+function launchPhase(): "launching" | "syncing" | "installing" {
+	if (busyText === "syncing") return "syncing";
+	if (busyText === "installing dependencies") return "installing";
+	return "launching";
+}
+
+/** A target's status as text — `failed` carries its exit code; launching carries its phase. */
 function statusLabel(id: string): string {
 	const status = targetStatus(id);
+	if (status === "launching") return `${launchPhase()}…`;
 	if (status === "failed") {
 		const code = terminals.get(id)?.exit?.code;
 		return code != null ? `failed (exit ${code})` : "failed";
 	}
 	return status;
+}
+
+/** What the sidebar action button reads: "Run" / "Stop" / phase-specific "…ing…" while launching. */
+function buttonLabel(status: TargetStatus): string {
+	if (status === "launching") {
+		const phase = launchPhase();
+		return `${phase.charAt(0).toUpperCase()}${phase.slice(1)}…`;
+	}
+	if (status === "running") return "Stop";
+	return "Run";
 }
 
 /** One target rendered as a card in the sidebar webview. */
@@ -260,6 +326,8 @@ interface CardData {
 	folder: string;
 	status: TargetStatus;
 	statusLabel: string;
+	/** Action-button text: "Run" / "Stop" / phase-specific "…ing…" while launching. */
+	buttonLabel: string;
 	/** A resolved `data:` URI for a custom icon, or undefined for the default. */
 	icon?: string;
 }
@@ -305,20 +373,22 @@ async function resolveIcon(rt: ResolvedTarget): Promise<string | undefined> {
 }
 
 /** Build the sidebar's state — one card per target, with resolved icons. */
-async function buildViewState(): Promise<{ cards: CardData[]; errors: string[] }> {
+async function buildViewState(): Promise<{ cards: CardData[]; errors: string[]; scanning: boolean }> {
 	const cards: CardData[] = [];
 	for (const rt of allTargets()) {
+		const status = targetStatus(rt.id);
 		cards.push({
 			id: rt.id,
 			label: rt.target.label ?? rt.key,
 			command: rt.target.command,
 			folder: rt.packageRel || "workspace root",
-			status: targetStatus(rt.id),
+			status,
 			statusLabel: statusLabel(rt.id),
+			buttonLabel: buttonLabel(status),
 			icon: await resolveIcon(rt),
 		});
 	}
-	return { cards, errors: configErrors };
+	return { cards, errors: configErrors, scanning };
 }
 
 /** Open the `.deskport/config.json` that defines a target. */
@@ -366,23 +436,42 @@ body { margin: 0; padding: 0; color: var(--vscode-foreground); font: var(--vscod
 .s-running, .s-exited { background: var(--vscode-charts-green, #89d185); }
 .s-failed { background: var(--vscode-errorForeground, #f14c4c); }
 .s-stopped { background: var(--vscode-charts-yellow, #cca700); }
+.s-launching { background: var(--vscode-progressBar-background, #0e639c); animation: dp-pulse 1.2s ease-in-out infinite; }
+@keyframes dp-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 .st-failed { color: var(--vscode-errorForeground, #f14c4c); }
 .actions { flex: none; }
 button { font: inherit; cursor: pointer; border: none; border-radius: 2px; padding: 4px 11px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
 button:hover { background: var(--vscode-button-hoverBackground); }
+button:disabled { cursor: default; opacity: .75; }
 button.stop { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
 button.stop:hover { background: var(--vscode-button-secondaryHoverBackground); }
 .empty { padding: 16px 12px; color: var(--vscode-descriptionForeground); }
 .empty button { margin-top: 10px; }
+.empty.scanning { color: var(--vscode-progressBar-background, #0e639c); animation: dp-pulse 1.2s ease-in-out infinite; }
 .err { padding: 8px 12px; color: var(--vscode-errorForeground); font-size: .92em; }
 .foot { padding: 6px 12px; color: var(--vscode-descriptionForeground); font-size: .85em; border-top: 1px solid var(--vscode-sideBarSectionHeader-border, rgba(128,128,128,.18)); }
+.foot .scan { color: var(--vscode-progressBar-background, #0e639c); animation: dp-pulse 1.2s ease-in-out infinite; }
 </style></head><body>
 <div id="root"></div>
-<div class="foot">DeskPort${extensionVersion ? " v" + extensionVersion : ""}</div>
+<div id="foot" class="foot">DeskPort${extensionVersion ? " v" + extensionVersion : ""}</div>
 <script nonce="${n}">
 const api = acquireVsCodeApi();
 const ROCKET = ${JSON.stringify(rocketSvg)};
+const VERSION = ${JSON.stringify(extensionVersion)};
 const root = document.getElementById("root");
+const foot = document.getElementById("foot");
+function setFoot(scanning) {
+	const base = "DeskPort" + (VERSION ? " v" + VERSION : "");
+	foot.textContent = "";
+	foot.appendChild(document.createTextNode(base));
+	if (scanning) {
+		foot.appendChild(document.createTextNode(" · "));
+		const s = document.createElement("span");
+		s.className = "scan";
+		s.textContent = "scanning…";
+		foot.appendChild(s);
+	}
+}
 function send(type, id) { api.postMessage({ type: type, id: id }); }
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function card(c) {
@@ -412,23 +501,30 @@ function card(c) {
 	body.appendChild(meta);
 	wrap.appendChild(body);
 	const actions = el("div", "actions");
+	const launching = c.status === "launching";
 	const running = c.status === "running";
-	const btn = el("button", running ? "stop" : "", running ? "Stop" : "Run");
-	btn.onclick = function () { send(running ? "stop" : "launch", c.id); };
+	const btn = el("button", running ? "stop" : "", c.buttonLabel);
+	if (launching) btn.disabled = true;
+	btn.onclick = function () { if (!launching) send(running ? "stop" : "launch", c.id); };
 	actions.appendChild(btn);
 	wrap.appendChild(actions);
 	return wrap;
 }
 function render(state) {
 	root.textContent = "";
+	setFoot(!!state.scanning);
 	for (const e of state.errors || []) root.appendChild(el("div", "err", e));
 	if (!state.cards || !state.cards.length) {
-		const d = el("div", "empty", "No DeskPort targets found in this workspace.");
-		const b = el("button", "", "Initialize Project");
-		b.onclick = function () { send("init"); };
-		d.appendChild(document.createElement("br"));
-		d.appendChild(b);
-		root.appendChild(d);
+		if (state.scanning) {
+			root.appendChild(el("div", "empty scanning", "Scanning workspace for .deskport/config.json…"));
+		} else {
+			const d = el("div", "empty", "No DeskPort targets found in this workspace.");
+			const b = el("button", "", "Initialize Project");
+			b.onclick = function () { send("init"); };
+			d.appendChild(document.createElement("br"));
+			d.appendChild(b);
+			root.appendChild(d);
+		}
 		return;
 	}
 	for (const c of state.cards) root.appendChild(card(c));
@@ -512,14 +608,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("deskport.openTerminal", (id: string) => openTerminal(id)),
 		vscode.window.registerWebviewViewProvider("deskport.targets", targetsProvider),
 		vscode.window.onDidCloseTerminal(forgetClosedTerminal),
-		vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+		vscode.workspace.onDidChangeWorkspaceFolders(() => {
 			workspace = resolveWorkspace();
-			await loadConfigs();
 			registerWatchers();
 			updateStatus();
+			void loadConfigs();
 		}),
 		{ dispose: () => watchers.forEach((w) => w.dispose()) },
-		{ dispose: stopSyncWatcher }
+		{ dispose: stopSyncWatchers }
 	);
 	registerWatchers();
 
@@ -531,12 +627,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		/* the default card icon is blank if the asset cannot be read */
 	}
 
-	try {
-		await loadConfigs();
-	} catch (err) {
-		output.appendLine(`[deskport] config scan failed: ${(err as Error).message}`);
-	}
-	updateStatus();
+	// Kick off the initial config scan in the background. Awaiting here would
+	// leave the extension stuck in activation until the scan returned — slow on
+	// large workspaces opened over Remote-SSH. `loadConfigs` posts its own
+	// `scanning…` state to the sidebar, and errors are logged inside it.
+	void loadConfigs();
 }
 
 export function deactivate(): void {
@@ -577,37 +672,77 @@ function decodeHost(raw: string): string {
 }
 
 /**
- * Discover every `.deskport/config.json` in the workspace (root and nested).
+ * Discover every `.deskport/config.json` in the workspace via VSCode's search
+ * service (ripgrep on the remote side under Remote-SSH). This is orders of
+ * magnitude faster than the previous recursive `workspace.fs.readDirectory`
+ * walk, which paid one network round-trip per directory and could take minutes
+ * on a large monorepo opened over Remote-SSH.
  *
- * Walks the tree with `vscode.workspace.fs` — the same filesystem bridge the
- * sync feature uses — rather than `findFiles`, so it works reliably when a
- * `ui`-kind extension scans a Remote-SSH workspace.
+ * Concurrent callers (activation, the FS watcher, the user-facing Refresh
+ * command, the workspace-folders listener) share one in-flight scan via
+ * {@link scanInFlight}. If anyone asks for a re-scan while one is running,
+ * {@link rescanNeeded} is set and another pass runs immediately after — so
+ * changes that landed during the current scan still get picked up.
  */
 async function loadConfigs(): Promise<void> {
+	if (scanInFlight) {
+		rescanNeeded = true;
+		return scanInFlight;
+	}
+	scanInFlight = (async () => {
+		do {
+			rescanNeeded = false;
+			await runScanPass();
+		} while (rescanNeeded);
+	})();
+	try {
+		await scanInFlight;
+	} finally {
+		scanInFlight = undefined;
+	}
+}
+
+/** One pass of the scan — drives the `scanning` indicator and populates {@link configs}. */
+async function runScanPass(): Promise<void> {
 	configs = [];
 	configErrors = [];
 	iconCache.clear();
 	if (!workspace) return;
-	await discoverConfigs(workspace.folder.uri, "");
-	// Root config first, then nested ones in path order — a stable menu order.
-	configs.sort((a, b) => a.packageRel.localeCompare(b.packageRel));
-}
 
-/** Recursively look for `.deskport/` folders, skipping excluded directories. */
-async function discoverConfigs(dir: vscode.Uri, rel: string): Promise<void> {
-	let entries: [string, vscode.FileType][];
+	scanning = true;
+	updateStatus();
+	output.appendLine("[deskport] scanning workspace for .deskport/config.json…");
+	const started = Date.now();
 	try {
-		entries = await vscode.workspace.fs.readDirectory(dir);
-	} catch {
-		return;
-	}
-	for (const [name, type] of entries) {
-		if (!(type & vscode.FileType.Directory) || isExcluded(name)) continue;
-		if (name === ".deskport") {
-			await readConfigFile(vscode.Uri.joinPath(dir, name, "config.json"), rel);
-		} else {
-			await discoverConfigs(vscode.Uri.joinPath(dir, name), rel ? `${rel}/${name}` : name);
+		// Build a brace-expansion exclude glob from DEFAULT_EXCLUDES so we
+		// don't waste search time inside `node_modules`, `.git`, build dirs,
+		// etc. Passing our own exclude overrides VSCode's `search.exclude`
+		// default — which is fine: a user-configured search.exclude shouldn't
+		// silently hide their DeskPort configs.
+		const exclude = `{${DEFAULT_EXCLUDES.map((d) => `**/${d}/**`).join(",")}}`;
+		const uris = await vscode.workspace.findFiles(
+			new vscode.RelativePattern(workspace.folder, "**/.deskport/config.json"),
+			exclude
+		);
+		for (const uri of uris) {
+			const rel = vscode.workspace.asRelativePath(uri, false);
+			// e.g. "packages/foo/.deskport/config.json" → packageRel "packages/foo"
+			//        ".deskport/config.json"            → packageRel ""
+			const packageRel = rel.split("/").slice(0, -2).join("/");
+			await readConfigFile(uri, packageRel);
 		}
+		// Root config first, then nested ones in path order — a stable menu order.
+		configs.sort((a, b) => a.packageRel.localeCompare(b.packageRel));
+		output.appendLine(
+			`[deskport] scan complete in ${Date.now() - started}ms — ${configs.length} config(s)`
+		);
+	} catch (err) {
+		const msg = (err as Error).message;
+		output.appendLine(`[deskport] config scan failed: ${msg}`);
+		configErrors.push(`Scan failed: ${msg}`);
+	} finally {
+		scanning = false;
+		updateStatus();
 	}
 }
 
@@ -661,6 +796,17 @@ function joinRel(a: string, b: string): string {
 	return [...a.split("/"), ...b.split("/")].filter((s) => s && s !== ".").join("/");
 }
 
+/**
+ * Whether a list of URIs touches any `.deskport` path — used to decide if a
+ * VSCode file-operation event (create/rename/delete from the Explorer or any
+ * other extension) should trigger a config re-scan. Matches both the
+ * `.deskport` directory itself and anything beneath it, so renaming a folder
+ * INTO `.deskport` (or out of it) is caught too.
+ */
+function touchesDeskport(uris: readonly vscode.Uri[]): boolean {
+	return uris.some((u) => /(^|\/)\.deskport(\/|$)/.test(u.path));
+}
+
 function registerWatchers(): void {
 	for (const w of watchers) w.dispose();
 	watchers = [];
@@ -683,7 +829,23 @@ function registerWatchers(): void {
 	configWatcher.onDidCreate(reload);
 	configWatcher.onDidDelete(reload);
 
-	watchers = [triggerWatcher, configWatcher];
+	// File-operation events complement the FS watcher: the FS watcher only
+	// notifies about `config.json` itself, so renaming/deleting a `.deskport`
+	// directory (or creating one via the Explorer's "New Folder") would
+	// otherwise need a manual refresh. These fire for VSCode-initiated ops
+	// from the Explorer or any extension's `workspace.fs` calls.
+	const onCreate = vscode.workspace.onDidCreateFiles((e) => {
+		if (touchesDeskport(e.files)) void reload();
+	});
+	const onDelete = vscode.workspace.onDidDeleteFiles((e) => {
+		if (touchesDeskport(e.files)) void reload();
+	});
+	const onRename = vscode.workspace.onDidRenameFiles((e) => {
+		const all = e.files.flatMap((p) => [p.oldUri, p.newUri]);
+		if (touchesDeskport(all)) void reload();
+	});
+
+	watchers = [triggerWatcher, configWatcher, onCreate, onDelete, onRename];
 }
 
 async function handleTrigger(uri: vscode.Uri): Promise<void> {
@@ -796,10 +958,44 @@ function resolveSshHost(alias: string): Promise<string> {
  */
 function scopeMirrorDir(ws: Workspace, scopeRel: string): string {
 	const trimmedRepo = ws.repoPath.replace(/\/+$/, "");
-	const scopeAbs = scopeRel ? `${trimmedRepo}/${scopeRel}` : trimmedRepo;
-	const parts = scopeAbs.split("/").filter(Boolean).map(sanitizeSegment);
+	return mirrorDirForAbs(ws, scopeRel ? `${trimmedRepo}/${scopeRel}` : trimmedRepo);
+}
+
+/**
+ * The local mirror folder for an **absolute remote path**. Unlike
+ * {@link scopeMirrorDir} (which anchors at the workspace folder), this can
+ * point above the opened folder — needed when a pnpm workspace root is
+ * discovered by walking up. The path still encodes the resolved host and the
+ * full absolute remote path, so a given remote folder always maps to one local
+ * mirror regardless of which parent the user opened.
+ */
+function mirrorDirForAbs(ws: Workspace, abs: string): string {
+	const parts = normalizeAbs(abs).split("/").filter(Boolean).map(sanitizeSegment);
 	const hostDir = ws.remote ? (resolvedHosts.get(ws.remote) ?? sanitizeSegment(ws.remote)) : "local";
 	return join(cloneRoot(), hostDir, ...parts);
+}
+
+/** Resolve `.`/`..` segments in an absolute remote path; always returns a leading `/`. */
+function normalizeAbs(p: string): string {
+	const out: string[] = [];
+	for (const seg of p.split("/")) {
+		if (!seg || seg === ".") continue;
+		if (seg === "..") out.pop();
+		else out.push(seg);
+	}
+	return "/" + out.join("/");
+}
+
+/** The parent of an absolute remote path, or the same path when already at root. */
+function parentAbs(abs: string): string {
+	const norm = normalizeAbs(abs);
+	const idx = norm.lastIndexOf("/");
+	return idx <= 0 ? "/" : norm.slice(0, idx);
+}
+
+/** A remote Uri for an absolute path on the same host as the workspace folder. */
+function remoteUriAt(ws: Workspace, abs: string): vscode.Uri {
+	return ws.folder.uri.with({ path: normalizeAbs(abs) });
 }
 
 /**
@@ -1002,6 +1198,236 @@ function scopeExcludes(cfg: LauncherConfig | undefined): string[] {
 }
 
 /**
+ * How many directory levels to walk up looking for a `pnpm-workspace.yaml`.
+ * A per-package `workspaceMaxHeight` in config.json wins; otherwise the
+ * `deskport.workspaceMaxHeight` setting; otherwise {@link DEFAULT_WORKSPACE_MAX_HEIGHT}.
+ * `0` (or negative) disables the walk.
+ */
+function effectiveMaxHeight(cfg: LauncherConfig | undefined): number {
+	if (typeof cfg?.workspaceMaxHeight === "number") return cfg.workspaceMaxHeight;
+	return vscode.workspace
+		.getConfiguration("deskport", workspace?.folder.uri)
+		.get<number>("workspaceMaxHeight", DEFAULT_WORKSPACE_MAX_HEIGHT);
+}
+
+/** Parse JSON from a remote Uri, returning `undefined` if missing or invalid. */
+async function readRemoteJson<T>(uri: vscode.Uri): Promise<T | undefined> {
+	try {
+		const bytes = await vscode.workspace.fs.readFile(uri);
+		return JSON.parse(Buffer.from(bytes).toString("utf8")) as T;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Walk up from `startAbs` (an absolute remote path) up to `maxHeight` levels,
+ * returning the first directory that contains a `pnpm-workspace.yaml` — i.e.
+ * the pnpm workspace root, found the same way pnpm itself finds it. Level 0 is
+ * `startAbs` (a single-package workspace), so `maxHeight` parents are checked
+ * above it. Returns `undefined` when none is found within the cap.
+ */
+async function discoverPnpmRoot(ws: Workspace, startAbs: string, maxHeight: number): Promise<string | undefined> {
+	if (maxHeight < 1) return undefined; // 0 (or negative) disables the walk-up entirely
+	let dir = normalizeAbs(startAbs);
+	for (let level = 0; level <= maxHeight; level++) {
+		try {
+			await vscode.workspace.fs.stat(remoteUriAt(ws, `${dir}/${PNPM_WORKSPACE_FILE}`));
+			return dir;
+		} catch {
+			/* not here — climb */
+		}
+		const parent = parentAbs(dir);
+		if (parent === dir) break; // reached the filesystem root
+		dir = parent;
+	}
+	return undefined;
+}
+
+/** Strip surrounding single/double quotes from a YAML scalar. */
+function stripQuotes(s: string): string {
+	const t = s.trim();
+	if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) return t.slice(1, -1);
+	return t;
+}
+
+/**
+ * Read the `packages:` globs from a `pnpm-workspace.yaml`. Handles the common
+ * block-list form (`packages:` then `  - "glob"` lines) and the inline-array
+ * form (`packages: ["a/*", "b/*"]`). This is a deliberately small parser — it
+ * only needs the package globs, not arbitrary YAML — and ignores everything
+ * else (`catalog:`, `catalogs:`, etc.).
+ */
+async function readPnpmWorkspaceGlobs(ws: Workspace, rootAbs: string): Promise<string[]> {
+	let text: string;
+	try {
+		const bytes = await vscode.workspace.fs.readFile(remoteUriAt(ws, `${rootAbs}/${PNPM_WORKSPACE_FILE}`));
+		text = Buffer.from(bytes).toString("utf8");
+	} catch {
+		return [];
+	}
+	const globs: string[] = [];
+	let inPackages = false;
+	for (const raw of text.split(/\r?\n/)) {
+		const line = raw.replace(/\r$/, "");
+		const keyMatch = line.match(/^packages\s*:(.*)$/);
+		if (keyMatch) {
+			const inline = keyMatch[1]!.trim();
+			if (inline.startsWith("[")) {
+				for (const item of inline.replace(/^\[/, "").replace(/\].*$/, "").split(","))
+					if (item.trim()) globs.push(stripQuotes(item));
+			} else {
+				inPackages = true;
+			}
+			continue;
+		}
+		if (!inPackages) continue;
+		const item = line.match(/^\s*-\s*(.+?)\s*$/);
+		if (item) {
+			globs.push(stripQuotes(item[1]!));
+		} else if (/^\S/.test(line)) {
+			inPackages = false; // dedented to a new top-level key — block ended
+		}
+	}
+	return globs;
+}
+
+/** Subdirectory names under an absolute remote path, skipping default-excluded dirs. */
+async function listRemoteDirs(ws: Workspace, abs: string): Promise<string[]> {
+	try {
+		const entries = await vscode.workspace.fs.readDirectory(remoteUriAt(ws, abs));
+		return entries
+			.filter(([name, type]) => type & vscode.FileType.Directory && !isExcluded(name))
+			.map(([name]) => name);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Expand one workspace glob (already split into segments) against the remote
+ * tree, collecting matching absolute directory paths into `out`. Supports the
+ * forms pnpm workspaces use in practice: literal segments, `*`/`?` wildcards
+ * (one level), and `**` (any depth). `node_modules`/`.git`/etc. are never
+ * descended (see {@link listRemoteDirs}).
+ */
+async function expandWorkspaceGlob(ws: Workspace, baseAbs: string, segs: string[], out: Set<string>): Promise<void> {
+	if (segs.length === 0) {
+		out.add(normalizeAbs(baseAbs));
+		return;
+	}
+	const [head, ...rest] = segs;
+	if (head === "**") {
+		await expandWorkspaceGlob(ws, baseAbs, rest, out); // ** matches zero segments
+		for (const child of await listRemoteDirs(ws, baseAbs))
+			await expandWorkspaceGlob(ws, `${baseAbs}/${child}`, segs, out); // …and any depth
+		return;
+	}
+	if (head!.includes("*") || head!.includes("?")) {
+		const compiled = compileGlob(head!);
+		for (const child of await listRemoteDirs(ws, baseAbs))
+			if (!compiled || compiled.re.test(child)) await expandWorkspaceGlob(ws, `${baseAbs}/${child}`, rest, out);
+		return;
+	}
+	await expandWorkspaceGlob(ws, `${baseAbs}/${head}`, rest, out);
+}
+
+/**
+ * Build the workspace's `name → absolute-dir` map by expanding the
+ * `pnpm-workspace.yaml` globs and reading each member's `package.json` name.
+ * Members without a readable `package.json` (or a `name`) are skipped.
+ */
+async function enumerateWorkspaceMembers(ws: Workspace, rootAbs: string, globs: string[]): Promise<Map<string, string>> {
+	const dirs = new Set<string>();
+	for (const glob of globs) {
+		if (glob.startsWith("!")) continue; // pnpm exclusion glob — not a member source
+		await expandWorkspaceGlob(ws, rootAbs, glob.split("/").filter(Boolean), dirs);
+	}
+	const members = new Map<string, string>();
+	for (const dir of dirs) {
+		const pkg = await readRemoteJson<{ name?: string }>(remoteUriAt(ws, `${dir}/package.json`));
+		if (pkg?.name) members.set(pkg.name, dir);
+	}
+	return members;
+}
+
+/** Dependency manifest fields scanned when following the workspace graph. */
+const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+
+/**
+ * Resolve the set of workspace member directories the target depends on,
+ * transitively — any dependency whose name is a workspace member is followed
+ * (pnpm links those regardless of the version spec). The target's own dir is
+ * never included. `members` maps package name → absolute dir.
+ */
+async function resolveWorkspaceClosure(
+	ws: Workspace,
+	members: Map<string, string>,
+	targetAbs: string
+): Promise<string[]> {
+	const closure = new Set<string>();
+	const queue = [normalizeAbs(targetAbs)];
+	const seen = new Set<string>(queue);
+	while (queue.length) {
+		const dir = queue.shift()!;
+		const pkg = await readRemoteJson<Record<string, unknown>>(remoteUriAt(ws, `${dir}/package.json`));
+		if (!pkg) continue;
+		for (const field of DEP_FIELDS) {
+			const deps = pkg[field];
+			if (!deps || typeof deps !== "object") continue;
+			for (const depName of Object.keys(deps as Record<string, unknown>)) {
+				const depDir = members.get(depName);
+				if (!depDir || seen.has(depDir)) continue;
+				seen.add(depDir);
+				closure.add(depDir);
+				queue.push(depDir);
+			}
+		}
+	}
+	return [...closure];
+}
+
+/**
+ * Resolve a config's `include` entries to absolute remote paths within a
+ * discovered workspace root, dropping (and logging) any that escape it.
+ */
+function resolveIncludeAbs(extras: readonly string[] | undefined, packageAbs: string, rootAbs: string): string[] {
+	if (!extras) return [];
+	const out: string[] = [];
+	for (const raw of extras) {
+		const abs = normalizeAbs(`${packageAbs}/${raw}`);
+		if (abs !== rootAbs && !abs.startsWith(rootAbs + "/")) {
+			output.appendLine(`[deskport] include "${raw}" escapes workspace root ${rootAbs}, skipped`);
+			continue;
+		}
+		out.push(abs);
+	}
+	return out;
+}
+
+/** Drop any absolute scope already covered by an ancestor scope in the list. */
+function dedupeAbsScopes(abs: string[]): string[] {
+	const uniq = [...new Set(abs.map(normalizeAbs))].sort((a, b) => a.length - b.length);
+	const kept: string[] = [];
+	for (const s of uniq) if (!kept.some((k) => s === k || s.startsWith(k + "/"))) kept.push(s);
+	return kept;
+}
+
+/**
+ * Rewrite a package's `install` command for a workspace-root install. A bare
+ * `pnpm install` / `pnpm i` is scoped to the target package and its
+ * dependencies (`--filter "<name>..."`) so a partial member set installs
+ * cleanly with correct linkage. A customized command runs verbatim — the user
+ * owns it.
+ */
+function rootInstallCommand(rawInstall: string | undefined, targetName: string | undefined): string | undefined {
+	const cmd = rawInstall?.trim();
+	if (!cmd) return undefined;
+	if (targetName && /^pnpm(\s+(install|i))?$/.test(cmd)) return `pnpm install --filter "${targetName}..."`;
+	return cmd;
+}
+
+/**
  * Copy one remote file into the mirror, skipping it when already up to date.
  *
  * A `remoteStat` may be passed in to reuse a stat the caller already did —
@@ -1175,9 +1601,9 @@ type SyncResult = "ok" | "cancelled";
 
 /** One subtree the cold sync should mirror, with the filters that apply to it. */
 interface SyncJob {
-	/** Workspace-relative scope path; `""` for the workspace root. */
+	/** Scope identity: a workspace-relative path (legacy) or an absolute remote path (workspace mode). */
 	scope: string;
-	/** Scope-relative source: a workspace folder + the scope path. */
+	/** Source root: the scope's remote folder. */
 	remoteRoot: vscode.Uri;
 	/** Local folder this subtree mirrors into. */
 	localRoot: string;
@@ -1187,6 +1613,19 @@ interface SyncJob {
 	excludes: string[];
 	/** File-level filter for this scope. */
 	filter: ScopeFilter;
+	/**
+	 * When set, mirror only these specific scope-relative files instead of
+	 * walking the whole subtree — used for the workspace-root manifests
+	 * (`pnpm-workspace.yaml`, lockfile, …) so we pull them without dragging in
+	 * the entire root directory. A files-only job never prunes (it must not
+	 * delete sibling root files it doesn't own), and absent files are skipped.
+	 */
+	files?: string[];
+}
+
+/** Stable key for {@link activeJobs}; distinguishes a files-only scope from a subtree at the same path. */
+function jobKey(job: SyncJob): string {
+	return `${job.files ? "F" : "D"}:${job.scope}`;
 }
 
 /**
@@ -1211,27 +1650,39 @@ async function syncAll(
 	progress: vscode.Progress<{ message?: string; increment?: number }>,
 	token: vscode.CancellationToken
 ): Promise<SyncResult> {
-	type ScannedJob = SyncJob & { files: ScannedFile[]; totalBytes: number };
+	type ScannedJob = SyncJob & { found: ScannedFile[]; totalBytes: number };
 	const scanned: ScannedJob[] = [];
 	for (const job of jobs) {
 		progress.report({ message: `scanning ${job.label}…` });
 		output.appendLine(`[deskport] scanning ${job.label}…`);
 		const files: ScannedFile[] = [];
-		let lastScanReport = 0;
-		await scanRemote(job.remoteRoot, "", files, token, new Set<string>(), job.excludes, job.filter, (count) => {
-			const now = Date.now();
-			if (now - lastScanReport >= 200) {
-				progress.report({ message: `scanning ${job.label} — ${count} files found…` });
-				lastScanReport = now;
+		if (job.files) {
+			// Files-only job: stat just the named files, skipping any that are absent.
+			for (const rel of job.files) {
+				try {
+					const s = await vscode.workspace.fs.stat(vscode.Uri.joinPath(job.remoteRoot, ...rel.split("/")));
+					files.push({ rel, size: s.size, mtime: s.mtime });
+				} catch {
+					/* manifest not present at this root — fine */
+				}
 			}
-		});
+		} else {
+			let lastScanReport = 0;
+			await scanRemote(job.remoteRoot, "", files, token, new Set<string>(), job.excludes, job.filter, (count) => {
+				const now = Date.now();
+				if (now - lastScanReport >= 200) {
+					progress.report({ message: `scanning ${job.label} — ${count} files found…` });
+					lastScanReport = now;
+				}
+			});
+		}
 		if (token.isCancellationRequested) return "cancelled";
 		const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
 		output.appendLine(`[deskport] scan found ${files.length} file(s) in ${job.label}, ${formatBytes(totalBytes)}`);
-		scanned.push({ ...job, files, totalBytes });
+		scanned.push({ ...job, found: files, totalBytes });
 	}
 
-	const grandFiles = scanned.reduce((a, j) => a + j.files.length, 0);
+	const grandFiles = scanned.reduce((a, j) => a + j.found.length, 0);
 	const grandBytes = scanned.reduce((a, j) => a + j.totalBytes, 0);
 	let processedFiles = 0;
 	let copied = 0;
@@ -1240,7 +1691,7 @@ async function syncAll(
 	const fallbackStep = grandFiles > 0 ? 100 / grandFiles : 0;
 	for (const j of scanned) {
 		const kept = new Set<string>();
-		for (const f of j.files) {
+		for (const f of j.found) {
 			if (token.isCancellationRequested) return "cancelled";
 			kept.add(f.rel);
 			const remote = vscode.Uri.joinPath(j.remoteRoot, ...f.rel.split("/").filter(Boolean));
@@ -1260,12 +1711,17 @@ async function syncAll(
 			});
 		}
 		if (token.isCancellationRequested) return "cancelled";
-		progress.report({ message: `removing stale files in ${j.label}…` });
 		let removed = 0;
-		try {
-			removed = await pruneMirror(j.localRoot, "", kept, j.excludes);
-		} catch (err) {
-			output.appendLine(`[deskport] prune failed in ${j.label}: ${(err as Error).message}`);
+		// Files-only jobs share their mirror dir with sibling files they don't
+		// own (e.g. the root manifests sit beside package mirror dirs), so they
+		// must never prune.
+		if (!j.files) {
+			progress.report({ message: `removing stale files in ${j.label}…` });
+			try {
+				removed = await pruneMirror(j.localRoot, "", kept, j.excludes);
+			} catch (err) {
+				output.appendLine(`[deskport] prune failed in ${j.label}: ${(err as Error).message}`);
+			}
 		}
 		output.appendLine(
 			`[deskport] mirror ready (${j.label}) — ${copied} updated, ${skipped} unchanged, ${removed} removed` +
@@ -1275,65 +1731,72 @@ async function syncAll(
 	return "ok";
 }
 
-function ensureSyncWatcher(): void {
-	if (!workspace || workspace.remote === null || syncWatcher) return;
-	syncWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(workspace.folder, "**/*"));
-	syncWatcher.onDidCreate((u) => void onSyncEvent(u, "upsert"));
-	syncWatcher.onDidChange((u) => void onSyncEvent(u, "upsert"));
-	syncWatcher.onDidDelete((u) => void onSyncEvent(u, "delete"));
+/**
+ * (Re)build the live FS watchers from {@link activeJobs} — one recursive
+ * watcher per subtree scope, and one watcher per file for a files-only scope.
+ * Rooting each watcher at its own scope (rather than one watcher over the whole
+ * workspace) is what lets a scope sit *above* the opened folder — needed when a
+ * pnpm workspace root is discovered by walking up. It also avoids firing for
+ * unrelated siblings in a large monorepo.
+ *
+ * Watching a remote path outside the opened folder is best-effort: if the
+ * Remote-SSH watcher doesn't deliver those events, the cold sync re-run on the
+ * next launch still reconciles the mirror, so correctness never depends on it.
+ */
+function ensureSyncWatchers(): void {
+	if (!workspace || workspace.remote === null) return;
+	stopSyncWatchers();
+	for (const job of activeJobs.values()) {
+		const patterns = job.files
+			? job.files.map((f) => new vscode.RelativePattern(job.remoteRoot, f))
+			: [new vscode.RelativePattern(job.remoteRoot, "**/*")];
+		for (const pattern of patterns) {
+			const w = vscode.workspace.createFileSystemWatcher(pattern);
+			w.onDidCreate((u) => void onScopeEvent(job, u, "upsert"));
+			w.onDidChange((u) => void onScopeEvent(job, u, "upsert"));
+			w.onDidDelete((u) => void onScopeEvent(job, u, "delete"));
+			syncWatchers.push(w);
+		}
+	}
 }
 
-function stopSyncWatcher(): void {
-	syncWatcher?.dispose();
-	syncWatcher = undefined;
+function stopSyncWatchers(): void {
+	for (const w of syncWatchers) w.dispose();
+	syncWatchers = [];
 }
 
 /**
- * The synced scope that owns a workspace-relative path, or `undefined` if
- * nothing covers it. When several synced scopes nest, prefer the deepest one
- * (longest match) — that's the smallest local mirror dir that still contains
- * the file, so its rel-to-scope path is shortest.
+ * Mirror a single live FS event into its scope's local mirror dir, applying
+ * the same filters the cold sync used. The event's path is made relative to
+ * the job's remote root directly (no `asRelativePath`, which is anchored to the
+ * opened folder and can't express a scope above it).
  */
-function owningScope(rel: string): string | undefined {
-	let best: string | undefined;
-	for (const scope of syncedScopes.keys()) {
-		if (scope === "" || rel === scope || rel.startsWith(scope + "/")) {
-			if (best === undefined || scope.length > best.length) best = scope;
+async function onScopeEvent(job: SyncJob, uri: vscode.Uri, kind: "upsert" | "delete"): Promise<void> {
+	const base = job.remoteRoot.path.replace(/\/+$/, "");
+	if (uri.path !== base && !uri.path.startsWith(base + "/")) return;
+	const relInScope = uri.path === base ? "" : uri.path.slice(base.length + 1);
+	if (job.files) {
+		// Files-only scope: only the named files are mirrored, never pruned.
+		if (!job.files.includes(relInScope)) return;
+		if (kind === "delete") return;
+		try {
+			await mirrorFile(uri, join(job.localRoot, relInScope));
+		} catch (err) {
+			output.appendLine(`[deskport] sync skipped ${relInScope}: ${(err as Error).message}`);
 		}
+		return;
 	}
-	return best;
-}
-
-async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<void> {
-	if (!workspace) return;
-	const ws = workspace;
-	const rel = vscode.workspace.asRelativePath(uri, false);
-	// The FS watcher fires for the whole workspace, but each scope mirrors to
-	// its own local folder — route the event into the owning scope's dir, and
-	// ignore events that fall outside every cold-synced scope.
-	const scope = owningScope(rel);
-	if (scope === undefined) return;
-	const filter = syncedScopes.get(scope);
-	if (!filter) return;
-	// Reuse the scope's filters so live updates obey the same `.gitignore` /
-	// file-exclude rules as the cold sync that produced this mirror.
-	const relInScope = scope === "" ? rel : rel.slice(scope.length + 1);
 	const segments = relInScope ? relInScope.split("/") : [];
-	const cfg = configs.find((c) => c.packageRel === scope)?.config;
-	const excludes = scopeExcludes(cfg);
-	if (segments.some((seg) => isExcluded(seg, excludes))) return;
+	if (segments.some((seg) => isExcluded(seg, job.excludes))) return;
 	const name = segments[segments.length - 1] ?? "";
-	const forced = matchesAnyGlob(filter.includeFiles, name, relInScope);
+	const forced = matchesAnyGlob(job.filter.includeFiles, name, relInScope);
 	if (!forced) {
-		if (kind === "upsert" && matchesAnyGlob(filter.excludeFiles, name, relInScope)) return;
-		// Use isDir=false because the watcher fires per file; if a directory
-		// matches a gitignore rule, its children's paths will also match the
-		// same rule (or a prefix of it).
-		if (isGitignored(filter.ignoreRules, relInScope, false)) return;
+		if (kind === "upsert" && matchesAnyGlob(job.filter.excludeFiles, name, relInScope)) return;
+		// isDir=false: the watcher fires per file; a directory matching a
+		// gitignore rule has children whose paths match the same rule (or a prefix).
+		if (isGitignored(job.filter.ignoreRules, relInScope, false)) return;
 	}
-
-	const scopeDir = scopeMirrorDir(ws, scope);
-	const localPath = relInScope ? join(scopeDir, relInScope) : scopeDir;
+	const localPath = relInScope ? join(job.localRoot, relInScope) : job.localRoot;
 	try {
 		if (kind === "delete") {
 			await rm(localPath, { recursive: true, force: true });
@@ -1341,12 +1804,12 @@ async function onSyncEvent(uri: vscode.Uri, kind: "upsert" | "delete"): Promise<
 		}
 		const remoteStat = await vscode.workspace.fs.stat(uri);
 		if (remoteStat.type & vscode.FileType.Directory) {
-			await mirrorSubtree(uri, relInScope, scopeDir, excludes, filter);
+			await mirrorSubtree(uri, relInScope, job.localRoot, job.excludes, job.filter);
 		} else {
 			await mirrorFile(uri, localPath);
 		}
 	} catch (err) {
-		output.appendLine(`[deskport] sync skipped ${rel}: ${(err as Error).message}`);
+		output.appendLine(`[deskport] sync skipped ${relInScope}: ${(err as Error).message}`);
 	}
 }
 
@@ -1364,6 +1827,35 @@ function childEnv(): NodeJS.ProcessEnv {
 }
 
 /**
+ * Signal a target's shell child and everything it launched.
+ *
+ * Targets run with `shell: true`, so the direct child is a `sh -c <cmd>` (or
+ * `cmd /c` on Windows). A plain `child.kill()` only signals the shell; the
+ * actual program (e.g. an Electron app launched via `npm run`) is the shell's
+ * grandchild and would otherwise survive, reparented to init. To stop the
+ * whole tree we spawn the shell with `detached: true` on POSIX — making it
+ * its own process-group leader — then signal the negative pid to reach every
+ * member. Windows has no equivalent process groups, so we shell out to
+ * `taskkill /T /F` to walk the child tree.
+ */
+function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): void {
+	if (!child.pid || child.exitCode !== null) return;
+	if (process.platform === "win32") {
+		try {
+			spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+		} catch {
+			try { child.kill(signal); } catch { /* already gone */ }
+		}
+		return;
+	}
+	try {
+		process.kill(-child.pid, signal);
+	} catch {
+		try { child.kill(signal); } catch { /* already gone */ }
+	}
+}
+
+/**
  * Run a shell command, streaming its output to the channel while keeping a
  * bounded tail of it. Resolves with whether it succeeded and that tail, so a
  * caller can surface the failure detail.
@@ -1371,7 +1863,13 @@ function childEnv(): NodeJS.ProcessEnv {
 function runShell(commandLine: string, cwd: string): Promise<{ ok: boolean; tail: string }> {
 	return new Promise((resolve) => {
 		let tail = "";
-		const child = spawn(commandLine, { cwd, shell: true, env: childEnv() });
+		// CI=true tells package managers (pnpm in particular) that no TTY is
+		// available so they should skip interactive prompts instead of bailing
+		// with `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` when re-installing
+		// into an existing mirror. Scoped to runShell (install/setup commands)
+		// so it doesn't leak into the launched target's environment.
+		const env: NodeJS.ProcessEnv = { ...childEnv(), CI: "true" };
+		const child = spawn(commandLine, { cwd, shell: true, env });
 		const capture = (d: Buffer): void => {
 			const text = d.toString();
 			output.append(text);
@@ -1413,6 +1911,12 @@ async function launchTarget(id: string): Promise<void> {
 	output.appendLine("");
 	output.appendLine(`[deskport] launch ${JSON.stringify(id)}`);
 
+	// Mark the target "launching" before the toast appears so the sidebar
+	// button flips to "Launching…" immediately. Cleared in startProcess once
+	// the child is spawned, or below if a pre-spawn step fails or cancels.
+	launchingId = id;
+	void targetsProvider.refresh();
+
 	// Sync + install run inside a progress notification. The result is the
 	// directory to run from, or undefined when a step failed (already reported)
 	// or the user cancelled the launch.
@@ -1431,32 +1935,103 @@ async function launchTarget(id: string): Promise<void> {
 			// aliases. Cheap after the first call (cached for the session).
 			await resolveSshHost(ws.remote);
 
-			// Scope the cold sync to this target's package folder, not the whole
-			// workspace, and (optionally) to extra paths listed in the config's
-			// `include` so a cross-package monorepo can pull sibling libs the
-			// runtime needs. Each scope mirrors at its natural remote-abs path,
-			// so relative imports keep working.
-			const primaryScope = rt.packageRel;
-			const packageDir = scopeMirrorDir(ws, primaryScope);
-			const cwd = join(packageDir, targetCwdRel);
-			const scopes = dedupeScopes([primaryScope, ...resolveExtraScopes(rt.pkg.config.include, primaryScope)]);
+			// What the cold sync should produce: the subtree jobs, where the
+			// target runs, where (and how) `install` runs, and a key that makes
+			// install lazy per session.
+			interface Plan {
+				jobs: SyncJob[];
+				packageDir: string;
+				cwd: string;
+				installCmd?: string;
+				installCwd: string;
+				installKey: string;
+			}
 
-			const buildJob = async (scope: string): Promise<SyncJob> => {
-				const segments = scope.split("/").filter(Boolean);
-				const remoteRoot =
-					segments.length > 0 ? vscode.Uri.joinPath(ws.folder.uri, ...segments) : ws.folder.uri;
-				const localRoot = scopeMirrorDir(ws, scope);
+			// A package config's `.gitignore`/file filters, scoped to one folder.
+			const buildJob = async (scope: string, remoteRoot: vscode.Uri, label: string): Promise<SyncJob> => {
+				const localRoot = mirrorDirForAbs(ws, remoteRoot.path);
 				await mkdir(localRoot, { recursive: true });
-				// Each scope reads its own root .gitignore — extras are typically
-				// separate packages with their own ignore rules.
 				const filter = await buildScopeFilter(remoteRoot, rt.pkg.config);
+				return { scope, remoteRoot, localRoot, label, excludes: scopeExcludes(rt.pkg.config), filter };
+			};
+
+			const packageAbs = normalizeAbs(`${ws.repoPath.replace(/\/+$/, "")}/${rt.packageRel}`);
+			const maxHeight = effectiveMaxHeight(rt.pkg.config);
+			const rootAbs = await discoverPnpmRoot(ws, packageAbs, maxHeight);
+
+			const buildPlan = async (): Promise<Plan> => {
+				if (rootAbs) {
+					// pnpm workspace: mirror the root manifests + this package + the
+					// target's workspace dependency closure, each at its natural
+					// absolute path, and install from the discovered root so pnpm
+					// links `workspace:*` deps correctly.
+					progress.report({ message: "resolving workspace…" });
+					const globs = await readPnpmWorkspaceGlobs(ws, rootAbs);
+					const members = await enumerateWorkspaceMembers(ws, rootAbs, globs);
+					const targetPkg = await readRemoteJson<{ name?: string }>(
+						remoteUriAt(ws, `${packageAbs}/package.json`)
+					);
+					const closure = await resolveWorkspaceClosure(ws, members, packageAbs);
+					const includeAbs = resolveIncludeAbs(rt.pkg.config.include, packageAbs, rootAbs);
+					const scopeAbs = dedupeAbsScopes([packageAbs, ...closure, ...includeAbs]);
+
+					const relTo = (abs: string): string => (abs === rootAbs ? "." : abs.slice(rootAbs.length + 1));
+					const rootMirror = mirrorDirForAbs(ws, rootAbs);
+					await mkdir(rootMirror, { recursive: true });
+					const jobs: SyncJob[] = [
+						{
+							scope: rootAbs,
+							remoteRoot: remoteUriAt(ws, rootAbs),
+							localRoot: rootMirror,
+							label: "workspace manifests",
+							excludes: scopeExcludes(rt.pkg.config),
+							filter: { ignoreRules: [], excludeFiles: [], includeFiles: [] },
+							files: PNPM_ROOT_FILES
+						}
+					];
+					for (const abs of scopeAbs) jobs.push(await buildJob(abs, remoteUriAt(ws, abs), relTo(abs)));
+
+					output.appendLine(`[deskport] pnpm workspace root: ${ws.remote}:${rootAbs}`);
+					output.appendLine(`[deskport] package: ${relTo(packageAbs)} (${members.size} member(s) discovered)`);
+					if (closure.length || includeAbs.length)
+						output.appendLine(`[deskport] dep scopes: ${scopeAbs.slice(1).map(relTo).join(", ") || "(none)"}`);
+
+					const packageDir = mirrorDirForAbs(ws, packageAbs);
+					const installCwd = rootMirror;
+					const installCmd = rootInstallCommand(rt.pkg.config.install, targetPkg?.name);
+					return {
+						jobs,
+						packageDir,
+						cwd: join(packageDir, targetCwdRel),
+						installCmd,
+						installCwd,
+						installKey: `${installCwd}::${installCmd ?? ""}`
+					};
+				}
+
+				// No workspace root within reach: mirror just this package folder
+				// (plus any `include` extras), exactly as before.
+				const primaryScope = rt.packageRel;
+				const scopes = dedupeScopes([primaryScope, ...resolveExtraScopes(rt.pkg.config.include, primaryScope)]);
+				const jobs: SyncJob[] = [];
+				for (const scope of scopes) {
+					const segments = scope.split("/").filter(Boolean);
+					const remoteRoot =
+						segments.length > 0 ? vscode.Uri.joinPath(ws.folder.uri, ...segments) : ws.folder.uri;
+					jobs.push(await buildJob(scope, remoteRoot, scope || "."));
+				}
+				const packageDir = scopeMirrorDir(ws, primaryScope);
+				const remoteAbs = primaryScope ? `${ws.repoPath.replace(/\/+$/, "")}/${primaryScope}` : ws.repoPath;
+				output.appendLine(`[deskport] remote: ${ws.remote}:${remoteAbs}`);
+				output.appendLine(`[deskport] mirror: ${packageDir}`);
+				if (scopes.length > 1) output.appendLine(`[deskport] scopes: ${scopes.map((s) => s || ".").join(", ")}`);
 				return {
-					scope,
-					remoteRoot,
-					localRoot,
-					label: scope || ".",
-					excludes: scopeExcludes(rt.pkg.config),
-					filter
+					jobs,
+					packageDir,
+					cwd: join(packageDir, targetCwdRel),
+					installCmd: rt.pkg.config.install?.trim(),
+					installCwd: packageDir,
+					installKey: rt.packageRel
 				};
 			};
 
@@ -1464,20 +2039,17 @@ async function launchTarget(id: string): Promise<void> {
 			// makes a no-op revalidation cheap, and it's the only thing that
 			// catches changes the live watcher missed (e.g. atomic-rename
 			// updates from `sed -i` that don't fire a usable watcher event).
-			const remoteAbs = primaryScope ? `${ws.repoPath.replace(/\/+$/, "")}/${primaryScope}` : ws.repoPath;
-			output.appendLine(`[deskport] remote: ${ws.remote}:${remoteAbs}`);
-			output.appendLine(`[deskport] mirror: ${packageDir}`);
-			if (scopes.length > 1) output.appendLine(`[deskport] scopes: ${scopes.map((s) => s || ".").join(", ")}`);
 			setBusy("syncing");
+			let plan: Plan;
 			try {
-				const jobs: SyncJob[] = [];
-				for (const scope of scopes) jobs.push(await buildJob(scope));
-				const result = await syncAll(jobs, progress, token);
+				plan = await buildPlan();
+				const result = await syncAll(plan.jobs, progress, token);
 				if (result === "cancelled") {
 					output.appendLine("[deskport] sync cancelled");
 					return undefined;
 				}
-				for (const j of jobs) syncedScopes.set(j.scope, j.filter);
+				activeJobs.clear();
+				for (const j of plan.jobs) activeJobs.set(jobKey(j), j);
 			} catch (err) {
 				const e = err as Error;
 				if (e.stack) output.appendLine(e.stack);
@@ -1490,18 +2062,17 @@ async function launchTarget(id: string): Promise<void> {
 				return undefined;
 			}
 
-			// Per-package install, lazily on this package's first launch.
-			const installCmd = rt.pkg.config.install?.trim();
-			if (installCmd && !installedPackages.has(rt.packageRel)) {
-				progress.report({ message: `installing dependencies — ${installCmd}` });
-				setBusy(`installing ${rt.packageRel || "."}`);
-				output.appendLine(`[deskport] install (${rt.packageRel || "."}): ${installCmd}`);
-				const install = await runShell(installCmd, packageDir);
+			// Install lazily, once per session per install target.
+			if (plan.installCmd && !installedPackages.has(plan.installKey)) {
+				progress.report({ message: `installing dependencies — ${plan.installCmd}` });
+				setBusy("installing dependencies");
+				output.appendLine(`[deskport] install (${plan.installCwd}): ${plan.installCmd}`);
+				const install = await runShell(plan.installCmd, plan.installCwd);
 				if (!install.ok) {
-					failLaunch(`install failed: ${installCmd}`, install.tail);
+					failLaunch(`install failed: ${plan.installCmd}`, install.tail);
 					return undefined;
 				}
-				installedPackages.add(rt.packageRel);
+				installedPackages.add(plan.installKey);
 			}
 
 			if (token.isCancellationRequested) {
@@ -1509,13 +2080,21 @@ async function launchTarget(id: string): Promise<void> {
 				return undefined;
 			}
 
-			await mkdir(cwd, { recursive: true });
-			return cwd;
+			await mkdir(plan.cwd, { recursive: true });
+			return plan.cwd;
 		}
 	);
 
 	clearBusy();
-	if (runCwd === undefined) return; // a sync/install step failed and reported it
+	if (runCwd === undefined) {
+		// Sync/install failed or was cancelled — drop the "launching…" flag so
+		// the sidebar reverts to "Run". (The failure has already been reported.)
+		if (launchingId === id) {
+			launchingId = undefined;
+			void targetsProvider.refresh();
+		}
+		return;
+	}
 
 	// Run the target in its terminal — a pseudoterminal whose process DeskPort
 	// spawns itself (in the local extension host), so it runs on THIS machine.
@@ -1546,9 +2125,11 @@ function createTargetTerminal(id: string): TargetTerminal {
 				startProcess(tt, rt, runCwd);
 			}
 		},
-		close: () => tt.child?.kill(),
+		close: () => {
+			if (tt.child) killProcessTree(tt.child);
+		},
 		handleInput: (data) => {
-			if (data === "\u0003") tt.child?.kill("SIGINT"); // Ctrl+C
+			if (data === "\u0003") { if (tt.child) killProcessTree(tt.child, "SIGINT"); } // Ctrl+C
 		},
 	};
 	tt.terminal = vscode.window.createTerminal({
@@ -1573,12 +2154,22 @@ function openTerminal(id: string): void {
 
 /** Spawn a target's process locally and stream it into its terminal. */
 function startProcess(tt: TargetTerminal, rt: ResolvedTarget, cwd: string): void {
-	tt.child?.kill(); // a relaunch replaces any process still running
+	if (tt.child) killProcessTree(tt.child); // a relaunch replaces any process still running
 	output.appendLine(`[deskport] $ ${rt.target.command}  (cwd: ${cwd})`);
 	tt.writer.fire(`\r\n\x1b[36m$ ${rt.target.command}\x1b[0m\r\n`);
 
-	const child = spawn(rt.target.command, { cwd, shell: true, env: childEnv() });
+	// `detached: true` on POSIX puts the shell in its own process group so
+	// killProcessTree can reach descendants (e.g. an Electron app spawned by
+	// `npm run`). Without this, a plain SIGTERM only reaches the shell and
+	// the GUI app survives, reparented to init.
+	const child = spawn(rt.target.command, {
+		cwd,
+		shell: true,
+		env: childEnv(),
+		detached: process.platform !== "win32",
+	});
 	tt.child = child;
+	if (launchingId === tt.id) launchingId = undefined; // running takes over from "launching…"
 	const stream = (d: Buffer): void => tt.writer.fire(d.toString().replace(/\r?\n/g, "\r\n"));
 	child.stdout?.on("data", stream);
 	child.stderr?.on("data", stream);
@@ -1599,7 +2190,7 @@ function startProcess(tt: TargetTerminal, rt: ResolvedTarget, cwd: string): void
 		onActiveChange();
 	});
 
-	ensureSyncWatcher();
+	ensureSyncWatchers();
 	onActiveChange();
 }
 
@@ -1608,14 +2199,14 @@ function stopTarget(id: string): void {
 	const tt = terminals.get(id);
 	if (!tt?.child) return;
 	output.appendLine(`[deskport] stopping ${JSON.stringify(id)}`);
-	tt.child.kill();
+	killProcessTree(tt.child);
 }
 
 /** When VSCode reports a terminal closed, kill its process and forget it. */
 function forgetClosedTerminal(closed: vscode.Terminal): void {
 	for (const [id, tt] of terminals) {
 		if (tt.terminal === closed) {
-			tt.child?.kill();
+			if (tt.child) killProcessTree(tt.child);
 			terminals.delete(id);
 			output.appendLine(`[deskport] terminal closed ${JSON.stringify(id)}`);
 			onActiveChange();
@@ -1626,11 +2217,11 @@ function forgetClosedTerminal(closed: vscode.Terminal): void {
 
 function stopAll(): void {
 	for (const tt of terminals.values()) {
-		tt.child?.kill();
+		if (tt.child) killProcessTree(tt.child);
 		tt.terminal.dispose();
 	}
 	terminals.clear();
-	stopSyncWatcher();
+	stopSyncWatchers();
 }
 
 /** Whether any target process is currently running. */
@@ -1642,8 +2233,8 @@ function anyRunning(): boolean {
 function onActiveChange(): void {
 	if (!anyRunning()) {
 		// No process running: drop the live mirror; re-sync/-install next launch.
-		stopSyncWatcher();
-		syncedScopes.clear();
+		stopSyncWatchers();
+		activeJobs.clear();
 		installedPackages.clear();
 	}
 	updateStatus();
