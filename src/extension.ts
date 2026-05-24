@@ -145,6 +145,12 @@ interface LauncherConfig {
 	 * `workspace:*` dependency closure, and `install` runs from there so pnpm
 	 * linkage resolves. When none is found, only this folder is synced.
 	 *
+	 * The walk only runs when **both** gates are satisfied: this package's
+	 * `install` command is pnpm-prefixed (`pnpm …`) **and** its own
+	 * `package.json` declares at least one `workspace:*` dep. A package whose
+	 * install is `npm install`, or that has no `workspace:*` deps, stays
+	 * self-contained even when a `pnpm-workspace.yaml` sits above it.
+	 *
 	 * Overrides the `deskport.workspaceMaxHeight` setting. `0` disables the walk.
 	 */
 	workspaceMaxHeight?: number;
@@ -194,6 +200,14 @@ interface TargetTerminal {
 	pending?: { rt: ResolvedTarget; runCwd: string };
 	/** How the most recent run ended — drives the sidebar status. */
 	exit?: { code: number | null; signal: NodeJS.Signals | null };
+	/**
+	 * Set when DeskPort itself initiates a stop (stop button, Ctrl+C, stop-all)
+	 * and cleared in the child's `exit` handler. Lets that handler distinguish
+	 * a user-driven shutdown from a real crash on Windows, where `taskkill /F`
+	 * exits the shell with `code: 1, signal: null` — indistinguishable from a
+	 * failure without this flag.
+	 */
+	stopping?: boolean;
 }
 
 let extensionUri: vscode.Uri;
@@ -1221,6 +1235,32 @@ async function readRemoteJson<T>(uri: vscode.Uri): Promise<T | undefined> {
 }
 
 /**
+ * Subset of the target package's `package.json` consulted at launch time.
+ * `name` feeds the `pnpm install --filter "<name>..."` rewrite; the four dep
+ * sections gate the walk-up — a package without any `workspace:*` deps does
+ * not need pnpm workspace linkage to install correctly.
+ */
+interface TargetPkgJson {
+	name?: string;
+	dependencies?: Record<string, string>;
+	devDependencies?: Record<string, string>;
+	peerDependencies?: Record<string, string>;
+	optionalDependencies?: Record<string, string>;
+}
+
+/** True iff any dep section of the package contains at least one `workspace:*` entry. */
+function pkgHasWorkspaceDeps(pkg: TargetPkgJson): boolean {
+	const sections = [pkg.dependencies, pkg.devDependencies, pkg.peerDependencies, pkg.optionalDependencies];
+	for (const section of sections) {
+		if (!section) continue;
+		for (const spec of Object.values(section)) {
+			if (typeof spec === "string" && spec.startsWith("workspace:")) return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Walk up from `startAbs` (an absolute remote path) up to `maxHeight` levels,
  * returning the first directory that contains a `pnpm-workspace.yaml` — i.e.
  * the pnpm workspace root, found the same way pnpm itself finds it. Level 0 is
@@ -1956,7 +1996,21 @@ async function launchTarget(id: string): Promise<void> {
 			};
 
 			const packageAbs = normalizeAbs(`${ws.repoPath.replace(/\/+$/, "")}/${rt.packageRel}`);
-			const maxHeight = effectiveMaxHeight(rt.pkg.config);
+			// Walk up to find a pnpm workspace root only when both gates pass:
+			//   (1) the install command is pnpm-prefixed — the user has opted in
+			//       to a pnpm-aware install
+			//   (2) the target package actually has a `workspace:*` dep that
+			//       needs a workspace root to resolve
+			// A package with `npm install`, or no `workspace:*` deps, installs
+			// at its own folder the same way it did pre-0.9.0 — even when a
+			// `pnpm-workspace.yaml` happens to sit above it (e.g. because other
+			// workspace members depend on this one via `workspace:*`).
+			const installLooksPnpm = /^pnpm\b/.test((rt.pkg.config.install ?? "").trim());
+			const targetPkg = installLooksPnpm
+				? await readRemoteJson<TargetPkgJson>(remoteUriAt(ws, `${packageAbs}/package.json`))
+				: undefined;
+			const wantsWorkspaceRoot = installLooksPnpm && !!targetPkg && pkgHasWorkspaceDeps(targetPkg);
+			const maxHeight = wantsWorkspaceRoot ? effectiveMaxHeight(rt.pkg.config) : 0;
 			const rootAbs = await discoverPnpmRoot(ws, packageAbs, maxHeight);
 
 			const buildPlan = async (): Promise<Plan> => {
@@ -1968,9 +2022,6 @@ async function launchTarget(id: string): Promise<void> {
 					progress.report({ message: "resolving workspace…" });
 					const globs = await readPnpmWorkspaceGlobs(ws, rootAbs);
 					const members = await enumerateWorkspaceMembers(ws, rootAbs, globs);
-					const targetPkg = await readRemoteJson<{ name?: string }>(
-						remoteUriAt(ws, `${packageAbs}/package.json`)
-					);
 					const closure = await resolveWorkspaceClosure(ws, members, packageAbs);
 					const includeAbs = resolveIncludeAbs(rt.pkg.config.include, packageAbs, rootAbs);
 					const scopeAbs = dedupeAbsScopes([packageAbs, ...closure, ...includeAbs]);
@@ -2129,7 +2180,12 @@ function createTargetTerminal(id: string): TargetTerminal {
 			if (tt.child) killProcessTree(tt.child);
 		},
 		handleInput: (data) => {
-			if (data === "\u0003") { if (tt.child) killProcessTree(tt.child, "SIGINT"); } // Ctrl+C
+			// Ctrl+C — user-initiated stop, mark stopping so the exit handler
+			// reports "stopped" rather than "failed" on Windows.
+			if (data === "\u0003" && tt.child) {
+				tt.stopping = true;
+				killProcessTree(tt.child, "SIGINT");
+			}
 		},
 	};
 	tt.terminal = vscode.window.createTerminal({
@@ -2185,7 +2241,11 @@ function startProcess(tt: TargetTerminal, rt: ResolvedTarget, cwd: string): void
 		tt.writer.fire(`\r\n\x1b[90m[deskport] exited (code ${code ?? 0}${signal ? `, ${signal}` : ""})\x1b[0m\r\n`);
 		if (tt.child === child) {
 			tt.child = undefined;
-			tt.exit = { code, signal };
+			// `taskkill /T /F` on Windows can't deliver a signal, so a stop we
+			// initiated arrives here as `code: 1, signal: null` — same shape as
+			// a crash. Synthesize a signal so the status reflects user intent.
+			tt.exit = tt.stopping && signal == null ? { code, signal: "SIGTERM" } : { code, signal };
+			tt.stopping = false;
 		}
 		onActiveChange();
 	});
@@ -2199,6 +2259,7 @@ function stopTarget(id: string): void {
 	const tt = terminals.get(id);
 	if (!tt?.child) return;
 	output.appendLine(`[deskport] stopping ${JSON.stringify(id)}`);
+	tt.stopping = true;
 	killProcessTree(tt.child);
 }
 

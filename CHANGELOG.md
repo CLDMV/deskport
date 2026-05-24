@@ -5,6 +5,13 @@ All notable changes to the DeskPort extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] - 2026-05-23
+
+### Fixed
+
+- **The pnpm-workspace walk-up no longer hijacks self-contained packages.** Since 0.9.0 DeskPort walked up from every launched target looking for a `pnpm-workspace.yaml` and, when found, switched the install to run from that root. That's correct for a package whose deps include `workspace:*` siblings, but it broke any package whose `.deskport/config.json` declared a self-contained install command — `install: "npm install"` got run at the workspace-root mirror (where it has no deps to install), and the package's own dependencies were silently skipped. The walk-up now only fires when **both** gates hold: (1) the package's install command is pnpm-prefixed, and (2) the target's own `package.json` declares at least one `workspace:*` dep across `dependencies` / `devDependencies` / `peerDependencies` / `optionalDependencies`. Either gate failing → install runs at the package folder, the same way it did pre-0.9.0.
+- **Stopping a target on Windows now reports "stopped" instead of "failed (exit 1)".** Windows has no signals, so `taskkill /T /F` exits the shell with `code: 1, signal: null` — the same shape `child.on("exit")` saw for a real crash. A `stopping` flag is now set on the terminal whenever DeskPort initiates a stop (stop button, Ctrl+C); the exit handler synthesizes a `SIGTERM` signal in that case so the status badge reflects user intent. POSIX behavior is unchanged.
+
 ## [0.9.4] - 2026-05-22
 
 ### Fixed
