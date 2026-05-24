@@ -1896,6 +1896,113 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"
 }
 
 /**
+ * Directory names never walked into during {@link sweepBrokenLinks}. Cheap
+ * shield against wandering into VCS / pnpm-store metadata; doesn't affect
+ * correctness, just bounds the work.
+ */
+const SWEEP_SKIP_DIRS = new Set([".git", ".pnpm-store"]);
+
+/**
+ * Remove dangling symlinks (and Windows junctions, which Node reports as
+ * symlinks) anywhere under any `node_modules/` in `rootDir`. Walks the tree
+ * with `readdir({ withFileTypes: true })`, checks each symlink entry with
+ * `stat` (which follows the link), and `rm`s the entry if the target is
+ * missing. Valid links and real package contents are untouched.
+ *
+ * Why this exists: `pnpm install` hashes the lockfile into
+ * `node_modules/.modules.yaml` and short-circuits with "Already up to date"
+ * on subsequent runs without re-walking the on-disk symlinks. Orphans left
+ * over from earlier installs (e.g. a removed dep that pnpm cleaned in its
+ * virtual store but didn't sweep from a package's `node_modules/`) then
+ * trip tools like `electron-rebuild` that walk the link tree directly. The
+ * mirror only sees these because `node_modules` isn't synced, so a fresh
+ * remote install never lands locally. Sweeping pre-install is the cheap
+ * fix that doesn't force a full `rm -rf node_modules` reinstall.
+ */
+async function sweepBrokenLinks(rootDir: string): Promise<number> {
+	let removed = 0;
+
+	const removeBrokenLink = async (full: string): Promise<void> => {
+		try {
+			await statLocal(full);
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "ENOTDIR") {
+				try {
+					await rm(full, { force: true });
+					removed += 1;
+				} catch {
+					// best-effort — a permission failure or race shouldn't abort the sweep
+				}
+			}
+		}
+	};
+
+	// Inside a `node_modules/` tree, descend only into structural directories
+	// (scope namespaces, nested `node_modules`, the pnpm virtual store). Real
+	// package source dirs are skipped so we don't walk every installed
+	// package's `src/`, `dist/`, etc.
+	const sweepNodeModules = async (nmDir: string): Promise<void> => {
+		let entries;
+		try {
+			entries = await readdir(nmDir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			const full = join(nmDir, e.name);
+			if (e.isSymbolicLink()) {
+				await removeBrokenLink(full);
+			} else if (e.isDirectory()) {
+				if (e.name === ".pnpm") {
+					let pnpmEntries;
+					try {
+						pnpmEntries = await readdir(full, { withFileTypes: true });
+					} catch {
+						continue;
+					}
+					// `.pnpm/<pkg>@<ver>/node_modules/` holds the actual install plus
+					// sibling symlinks; sweep each one as its own node_modules tree.
+					for (const p of pnpmEntries) {
+						if (p.isDirectory()) await sweepNodeModules(join(full, p.name, "node_modules"));
+					}
+				} else if (e.name.startsWith("@") || e.name === "node_modules") {
+					await sweepNodeModules(full);
+				}
+			}
+		}
+	};
+
+	// Top-level walk: traverse source dirs to find every `node_modules/` (root
+	// and per-workspace-package), then hand each off to `sweepNodeModules`.
+	const findAndSweep = async (dir: string): Promise<void> => {
+		let entries;
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			if (e.isSymbolicLink()) {
+				await removeBrokenLink(join(dir, e.name));
+				continue;
+			}
+			if (!e.isDirectory()) continue;
+			if (SWEEP_SKIP_DIRS.has(e.name)) continue;
+			const full = join(dir, e.name);
+			if (e.name === "node_modules") {
+				await sweepNodeModules(full);
+			} else {
+				await findAndSweep(full);
+			}
+		}
+	};
+
+	await findAndSweep(rootDir);
+	return removed;
+}
+
+/**
  * Run a shell command, streaming its output to the channel while keeping a
  * bounded tail of it. Resolves with whether it succeeded and that tail, so a
  * caller can surface the failure detail.
@@ -2115,6 +2222,17 @@ async function launchTarget(id: string): Promise<void> {
 
 			// Install lazily, once per session per install target.
 			if (plan.installCmd && !installedPackages.has(plan.installKey)) {
+				// Sweep dangling symlinks under the install root first. pnpm's
+				// "Already up to date" path doesn't re-walk `node_modules/`,
+				// so orphans from earlier installs (deps removed on the remote
+				// between syncs, partial filtered installs, etc.) never get
+				// cleaned and trip tools like `electron-rebuild`. Removing
+				// only broken links is cheap and safe — valid links stay put.
+				progress.report({ message: "cleaning stale symlinks…" });
+				const sweptCount = await sweepBrokenLinks(plan.installCwd);
+				if (sweptCount > 0)
+					output.appendLine(`[deskport] swept ${sweptCount} broken symlink(s) under ${plan.installCwd}`);
+
 				progress.report({ message: `installing dependencies — ${plan.installCmd}` });
 				setBusy("installing dependencies");
 				output.appendLine(`[deskport] install (${plan.installCwd}): ${plan.installCmd}`);

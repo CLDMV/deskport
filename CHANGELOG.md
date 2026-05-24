@@ -5,6 +5,12 @@ All notable changes to the DeskPort extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] - 2026-05-24
+
+### Fixed
+
+- **Stale `node_modules` symlinks on the mirror no longer break dependency-walking tools.** When a dependency is removed (or swapped) on the remote between launches, pnpm on the mirror often leaves a dangling symlink in some package's `node_modules/` — its lockfile hash matches `.modules.yaml`, so `pnpm install` reports "Already up to date" and never re-walks the on-disk links. Tools like `electron-rebuild` then crash with `ENOENT` when they `stat` the orphan during their dependency walk. The mirror only sees this because `node_modules` isn't synced, so a fresh remote install never lands locally — until now the only fix was to manually nuke `node_modules` on the local machine. DeskPort now sweeps dangling symlinks under the install root before each install: it walks every `node_modules/` (root + per-workspace-package + nested `.pnpm/<pkg>/node_modules/`), `stat`s each symlink, and removes only those whose target no longer resolves. Valid links and real package directories are untouched. Cross-platform via Node APIs — works the same on Windows (junctions are reported as symlinks by `Dirent.isSymbolicLink()`), macOS, and Linux. Logs `swept N broken symlink(s)` only when N > 0.
+
 ## [0.9.5] - 2026-05-23
 
 ### Fixed
