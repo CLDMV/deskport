@@ -5,6 +5,16 @@ All notable changes to the DeskPort extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] - 2026-05-24
+
+### Added
+
+- **The sidebar Stop button now works during the sync and install phases.** Previously the button was disabled with a phase label ("Syncing…" / "Installing…") all the way through the pre-spawn handoff, so a launch stuck in install (e.g. `pnpm install` hanging on a slow network, `electron-rebuild` waiting on `node-gyp`) could only be killed by hunting down the right terminal manually. The button is now clickable through every phase: during launching it reads **Stop** and cancels the in-flight launch — the cold sync's checkpoints bail, the install child and *its* descendants are tree-killed (pnpm + node-gyp + everything they spawned), and the launch returns cleanly without an error toast. The status row above the button still shows the current phase. The QuickPick menu and status-bar tooltip recognize the launching state too, showing "select to cancel" / "Cancel <name>" while a launch is in flight. The progress toast's X button has always existed and continues to work; both inputs now route through the same cancellation token, so they cancel identically.
+
+### Fixed
+
+- **Install commands on POSIX now spawn with `detached: true` so the tree-kill reaches descendants.** The shell that runs `pnpm install` (or any other `install` command) is the direct child, but the real work (node-gyp, electron-rebuild, etc.) lives in grandchildren. Without `detached`, `process.kill(-pid)` has no process group to signal and falls back to killing only the shell, leaving the install work reparented to init. Now the install shell leads its own process group on POSIX, the same way launched targets already did, and cancelling a stuck install actually stops everything it spawned. Windows is unchanged (it has no process groups; `taskkill /T /F` already walks the tree).
+
 ## [0.9.6] - 2026-05-24
 
 ### Fixed

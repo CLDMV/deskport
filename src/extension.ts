@@ -241,6 +241,14 @@ let busyText: string | undefined;
  * so a single id is enough.
  */
 let launchingId: string | undefined;
+/**
+ * Cancel handle for the in-flight launch (sync / install phase). When set,
+ * invoking it fires the launch's cancellation token *and* aborts any install
+ * child currently running, so {@link stopTarget} can interrupt a stuck
+ * pre-spawn launch the same way it stops a running target. Cleared from
+ * {@link launchTarget} when the launch ends (success, failure, or cancel).
+ */
+let activeLaunchCancel: (() => void) | undefined;
 let lastTriggerNonce: number | undefined;
 let watchers: vscode.Disposable[] = [];
 /** Live FS watchers — one (or, for a files-only scope, one per file) per active scope. */
@@ -322,13 +330,9 @@ function statusLabel(id: string): string {
 	return status;
 }
 
-/** What the sidebar action button reads: "Run" / "Stop" / phase-specific "…ing…" while launching. */
+/** What the sidebar action button reads: "Run" / "Stop". (The phase label sits in the status row.) */
 function buttonLabel(status: TargetStatus): string {
-	if (status === "launching") {
-		const phase = launchPhase();
-		return `${phase.charAt(0).toUpperCase()}${phase.slice(1)}…`;
-	}
-	if (status === "running") return "Stop";
+	if (status === "launching" || status === "running") return "Stop";
 	return "Run";
 }
 
@@ -517,9 +521,11 @@ function card(c) {
 	const actions = el("div", "actions");
 	const launching = c.status === "launching";
 	const running = c.status === "running";
-	const btn = el("button", running ? "stop" : "", c.buttonLabel);
-	if (launching) btn.disabled = true;
-	btn.onclick = function () { if (!launching) send(running ? "stop" : "launch", c.id); };
+	// "Stop" during launching cancels the in-flight sync/install; during
+	// running it kills the spawned target. Same command, same button styling.
+	const stopping = launching || running;
+	const btn = el("button", stopping ? "stop" : "", c.buttonLabel);
+	btn.onclick = function () { send(stopping ? "stop" : "launch", c.id); };
 	actions.appendChild(btn);
 	wrap.appendChild(actions);
 	return wrap;
@@ -2005,18 +2011,39 @@ async function sweepBrokenLinks(rootDir: string): Promise<number> {
 /**
  * Run a shell command, streaming its output to the channel while keeping a
  * bounded tail of it. Resolves with whether it succeeded and that tail, so a
- * caller can surface the failure detail.
+ * caller can surface the failure detail. When `signal` aborts mid-run, the
+ * shell *and its descendants* are killed via {@link killProcessTree} and the
+ * promise resolves with `{ ok: false }` and a `[cancelled]` marker in the
+ * tail, so callers can distinguish a user cancel from a real failure.
  */
-function runShell(commandLine: string, cwd: string): Promise<{ ok: boolean; tail: string }> {
+function runShell(commandLine: string, cwd: string, signal?: AbortSignal): Promise<{ ok: boolean; tail: string; cancelled: boolean }> {
 	return new Promise((resolve) => {
 		let tail = "";
+		let cancelled = false;
 		// CI=true tells package managers (pnpm in particular) that no TTY is
 		// available so they should skip interactive prompts instead of bailing
 		// with `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY` when re-installing
 		// into an existing mirror. Scoped to runShell (install/setup commands)
 		// so it doesn't leak into the launched target's environment.
 		const env: NodeJS.ProcessEnv = { ...childEnv(), CI: "true" };
-		const child = spawn(commandLine, { cwd, shell: true, env });
+		// `detached: true` on POSIX puts the shell in its own process group so
+		// killProcessTree can reach descendants (e.g. node-gyp spawned by pnpm
+		// install). Without this, killing only reaches the shell and the real
+		// work survives as an orphan.
+		const child = spawn(commandLine, {
+			cwd,
+			shell: true,
+			env,
+			detached: process.platform !== "win32"
+		});
+		const onAbort = (): void => {
+			cancelled = true;
+			killProcessTree(child);
+		};
+		if (signal) {
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+		}
 		const capture = (d: Buffer): void => {
 			const text = d.toString();
 			output.append(text);
@@ -2025,10 +2052,14 @@ function runShell(commandLine: string, cwd: string): Promise<{ ok: boolean; tail
 		child.stdout?.on("data", capture);
 		child.stderr?.on("data", capture);
 		child.on("error", (err) => {
+			if (signal) signal.removeEventListener("abort", onAbort);
 			output.appendLine(`[deskport] ${commandLine} failed to start: ${err.message}`);
-			resolve({ ok: false, tail: err.message });
+			resolve({ ok: false, tail: err.message, cancelled });
 		});
-		child.on("exit", (code) => resolve({ ok: code === 0, tail: tail.trim() }));
+		child.on("exit", (code) => {
+			if (signal) signal.removeEventListener("abort", onAbort);
+			resolve({ ok: !cancelled && code === 0, tail: tail.trim(), cancelled });
+		});
 	});
 }
 
@@ -2062,6 +2093,15 @@ async function launchTarget(id: string): Promise<void> {
 	// button flips to "Launching…" immediately. Cleared in startProcess once
 	// the child is spawned, or below if a pre-spawn step fails or cancels.
 	launchingId = id;
+	// One token source spans the whole launch's pre-spawn work. Two inputs
+	// fire it: (1) the progress toast's own cancellation token (the X
+	// button), and (2) {@link stopTarget} via {@link activeLaunchCancel},
+	// which is how the sidebar Stop button reaches a launch that hasn't
+	// spawned yet. Everything downstream — syncAll, the install AbortSignal,
+	// the post-step bail checks — reads from this single token, so both
+	// inputs cancel the launch identically.
+	const launchTokenSource = new vscode.CancellationTokenSource();
+	activeLaunchCancel = () => launchTokenSource.cancel();
 	void targetsProvider.refresh();
 
 	// Sync + install run inside a progress notification. The result is the
@@ -2069,7 +2109,9 @@ async function launchTarget(id: string): Promise<void> {
 	// or the user cancelled the launch.
 	const runCwd = await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `DeskPort: launching ${rt.key}`, cancellable: true },
-		async (progress, token): Promise<string | undefined> => {
+		async (progress, toastToken): Promise<string | undefined> => {
+			toastToken.onCancellationRequested(() => launchTokenSource.cancel());
+			const token = launchTokenSource.token;
 			const targetCwdRel = rt.target.cwd?.trim() || ".";
 			if (ws.remote === null) {
 				const cwd = join(ws.repoPath, rt.packageRel, targetCwdRel);
@@ -2236,7 +2278,20 @@ async function launchTarget(id: string): Promise<void> {
 				progress.report({ message: `installing dependencies — ${plan.installCmd}` });
 				setBusy("installing dependencies");
 				output.appendLine(`[deskport] install (${plan.installCwd}): ${plan.installCmd}`);
-				const install = await runShell(plan.installCmd, plan.installCwd);
+				// Bridge the launch token to an AbortSignal so the install child
+				// (and its descendants) get tree-killed if the user cancels.
+				const installAbort = new AbortController();
+				const onCancel = token.onCancellationRequested(() => installAbort.abort());
+				let install;
+				try {
+					install = await runShell(plan.installCmd, plan.installCwd, installAbort.signal);
+				} finally {
+					onCancel.dispose();
+				}
+				if (install.cancelled) {
+					output.appendLine("[deskport] install cancelled");
+					return undefined;
+				}
 				if (!install.ok) {
 					failLaunch(`install failed: ${plan.installCmd}`, install.tail);
 					return undefined;
@@ -2255,6 +2310,10 @@ async function launchTarget(id: string): Promise<void> {
 	);
 
 	clearBusy();
+	// The launch's cancel handle only matters while pre-spawn work is in flight.
+	// Whether we succeeded, failed, or were cancelled, we're past that now.
+	activeLaunchCancel = undefined;
+	launchTokenSource.dispose();
 	if (runCwd === undefined) {
 		// Sync/install failed or was cancelled — drop the "launching…" flag so
 		// the sidebar reverts to "Run". (The failure has already been reported.)
@@ -2372,8 +2431,16 @@ function startProcess(tt: TargetTerminal, rt: ResolvedTarget, cwd: string): void
 	onActiveChange();
 }
 
-/** Stop a target's running process; its terminal stays open for relaunch. */
+/** Stop a target's running process — or cancel its launch if it's still in sync/install. */
 function stopTarget(id: string): void {
+	// Pre-spawn phases (sync / install) haven't created a `tt.child` yet.
+	// Fire the launch token instead, which both bails the sync loop and
+	// tree-kills any install child that's currently running.
+	if (launchingId === id && activeLaunchCancel) {
+		output.appendLine(`[deskport] cancelling launch ${JSON.stringify(id)}`);
+		activeLaunchCancel();
+		return;
+	}
 	const tt = terminals.get(id);
 	if (!tt?.child) return;
 	output.appendLine(`[deskport] stopping ${JSON.stringify(id)}`);
@@ -2448,11 +2515,17 @@ async function showMenu(): Promise<void> {
 			lastPkg = pkgLabel;
 		}
 		const running = terminals.get(rt.id)?.child !== undefined;
+		const launching = launchingId === rt.id;
+		const stoppable = running || launching;
 		items.push({
-			label: `$(${running ? "debug-stop" : "rocket"}) ${rt.target.label ?? rt.key}`,
-			description: running ? "running — select to stop" : rt.target.command,
+			label: `$(${stoppable ? "debug-stop" : "rocket"}) ${rt.target.label ?? rt.key}`,
+			description: launching
+				? `${launchPhase()}… — select to cancel`
+				: running
+					? "running — select to stop"
+					: rt.target.command,
 			id: rt.id,
-			running
+			running: stoppable
 		});
 	}
 
@@ -2583,10 +2656,13 @@ function buildTooltip(): vscode.MarkdownString {
 			const id = targetId(pkg.packageRel, key);
 			const label = t.label ?? key;
 			const running = terminals.get(id)?.child !== undefined;
+			const launching = launchingId === id;
 			lines.push(
-				running
-					? `$(debug-stop) [Stop “${label}”](${commandUri("deskport.stop", id)})`
-					: `$(rocket) [${label}](${commandUri("deskport.launch", id)})`
+				launching
+					? `$(debug-stop) [Cancel “${label}”](${commandUri("deskport.stop", id)})`
+					: running
+						? `$(debug-stop) [Stop “${label}”](${commandUri("deskport.stop", id)})`
+						: `$(rocket) [${label}](${commandUri("deskport.launch", id)})`
 			);
 			shown++;
 		}
