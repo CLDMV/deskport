@@ -28,6 +28,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readdir, rm, stat as statLocal, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { compileIgnore, decideIgnored, type IgnoreChain, type IgnoreRule, type IgnoreScope } from "./gitignore";
 
 /**
  * Directory segments skipped by default during sync. Always applied; the
@@ -46,7 +47,9 @@ const DEFAULT_EXCLUDES = [
 	"__tests__",
 	"docs",
 	"examples",
-	"screenshots"
+	"screenshots",
+	"tmp",
+	".tmp"
 ];
 /**
  * Filename globs skipped by default during sync (docs / changelogs / test
@@ -254,12 +257,18 @@ let watchers: vscode.Disposable[] = [];
 /** Live FS watchers — one (or, for a files-only scope, one per file) per active scope. */
 let syncWatchers: vscode.FileSystemWatcher[] = [];
 /**
- * One scope's effective filter — the compiled `.gitignore` rules plus the
- * file-level globs the scope was synced with. Kept around after the cold sync
- * so the live FS watcher can apply the same filtering to incremental changes.
+ * One scope's effective filter — its gitignore policy plus the file-level globs
+ * the scope was synced with. Kept around after the cold sync so the live FS
+ * watcher can apply the same filtering to incremental changes.
+ *
+ * The compiled `.gitignore` rules are no longer stored flat here: they are read
+ * per-directory during the walk and cached in {@link gitignoreCache}, so a
+ * `.gitignore` at any depth is honored. This struct only records whether the
+ * gitignore layer is on at all.
  */
 interface ScopeFilter {
-	ignoreRules: IgnoreRule[];
+	/** Whether `.gitignore` files are honored for this scope (config `respectGitignore` !== false). */
+	respectGitignore: boolean;
 	/** {@link DEFAULT_FILE_EXCLUDES} merged with the config's `excludeFiles`. */
 	excludeFiles: string[];
 	/** The config's `includeFiles`. */
@@ -1075,67 +1084,23 @@ function matchesAnyGlob(globs: readonly string[], name: string, fullRel: string)
 	return false;
 }
 
-/** A single rule from a `.gitignore` file, compiled to a regex. */
-interface IgnoreRule {
-	pattern: RegExp;
-	/** True if the original line ended with `/` — matches only directories. */
-	dirOnly: boolean;
-}
+// `.gitignore` line compilation (`compileIgnore`) and chain-based matching
+// (`decideIgnored`, plus the `IgnoreRule` / `IgnoreScope` / `IgnoreChain` types)
+// live in ./gitignore — a vscode-free module so the matcher is unit-testable.
+// The IO half (reading + caching `.gitignore` files, building the chain across
+// the walk) stays here, below.
 
 /**
- * Compile one `.gitignore` line to a rule. Returns `undefined` for blank
- * lines, `#` comments, and negation patterns (`!keep.me` — unsupported here;
- * users should reach for `includeFiles` to force-include something).
- */
-function compileIgnore(rawLine: string): IgnoreRule | undefined {
-	let p = rawLine.replace(/\r$/, "");
-	// Trim trailing whitespace but preserve escaped trailing space (rare).
-	p = p.replace(/(?<!\\)\s+$/, "");
-	if (!p || p.startsWith("#") || p.startsWith("!")) return undefined;
-	let dirOnly = false;
-	if (p.endsWith("/")) {
-		dirOnly = true;
-		p = p.slice(0, -1);
-	}
-	// A leading `/` or an internal `/` anchors the pattern to the scope root.
-	let anchored = false;
-	if (p.startsWith("/")) {
-		anchored = true;
-		p = p.slice(1);
-	} else if (p.includes("/")) {
-		anchored = true;
-	}
-	try {
-		// Same escape-then-substitute approach as compileGlob — see its
-		// comment for why `*` and `?` must be in the escape set.
-		let re = p.replace(/[.+^${}()|[\]\\*?]/g, "\\$&");
-		re = re.replace(/\\\*\\\*\//g, "(?:.*/)?").replace(/\/\\\*\\\*/g, "(?:/.*)?").replace(/\\\*\\\*/g, ".*");
-		re = re.replace(/\\\*/g, "[^/]*").replace(/\\\?/g, "[^/]");
-		const final = anchored ? new RegExp(`^${re}(?:/.*)?$`) : new RegExp(`(?:^|.*/)${re}(?:/.*)?$`);
-		return { pattern: final, dirOnly };
-	} catch {
-		return undefined;
-	}
-}
-
-/** Whether any compiled gitignore rule matches a scope-relative path. */
-function isGitignored(rules: readonly IgnoreRule[], rel: string, isDir: boolean): boolean {
-	for (const r of rules) {
-		if (r.dirOnly && !isDir) continue;
-		if (r.pattern.test(rel)) return true;
-	}
-	return false;
-}
-
-/**
- * Read the `.gitignore` at the root of a remote scope and compile its rules.
+ * Read and compile the `.gitignore` in one remote directory.
  *
- * Returns an empty list if the file is missing or unreadable — the
- * surrounding sync continues as if `.gitignore` was empty rather than failing.
+ * Returns an empty list if the file is missing or unreadable — the surrounding
+ * sync continues as if that directory had no `.gitignore` rather than failing.
+ * Called per-directory during the walk (and lazily by the live watcher) so a
+ * `.gitignore` at any depth is honored, not only one at the scope root.
  */
-async function loadGitignore(remoteRoot: vscode.Uri): Promise<IgnoreRule[]> {
+async function loadGitignore(remoteDir: vscode.Uri): Promise<IgnoreRule[]> {
 	try {
-		const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(remoteRoot, GITIGNORE_REL));
+		const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(remoteDir, GITIGNORE_REL));
 		const text = Buffer.from(bytes).toString("utf8");
 		const rules: IgnoreRule[] = [];
 		for (const line of text.split(/\r?\n/)) {
@@ -1146,6 +1111,74 @@ async function loadGitignore(remoteRoot: vscode.Uri): Promise<IgnoreRule[]> {
 	} catch {
 		return [];
 	}
+}
+
+/** Shared empty rule-set for directories known (from a listing) to carry no `.gitignore`. */
+const NO_RULES: readonly IgnoreRule[] = [];
+/**
+ * Compiled `.gitignore` rules keyed by remote directory URI. Shared between the
+ * cold-sync walk and the live watcher so a `.gitignore` is read at most once per
+ * session. Invalidated per-directory when its own `.gitignore` changes (see
+ * {@link onScopeEvent}), and cleared wholesale at the start of each cold sync
+ * (see {@link syncAll}) so a launch never serves rules a prior session cached.
+ */
+const gitignoreCache = new Map<string, readonly IgnoreRule[]>();
+
+/**
+ * Compiled rules for one directory, via {@link gitignoreCache}.
+ *
+ * `hasGitignore` is the walk's hint from the directory listing: when `false`
+ * the read is skipped (the dir provably has no `.gitignore`). The live watcher
+ * has no listing, so it passes `undefined` — a cache miss then reads lazily and
+ * caches the result (even an empty one, so repeat events for the same subtree
+ * don't re-read).
+ */
+async function rulesForDir(dirUri: vscode.Uri, hasGitignore?: boolean): Promise<readonly IgnoreRule[]> {
+	const key = dirUri.toString();
+	const hit = gitignoreCache.get(key);
+	if (hit) return hit;
+	if (hasGitignore === false) return NO_RULES;
+	const rules = await loadGitignore(dirUri);
+	gitignoreCache.set(key, rules);
+	return rules;
+}
+
+/**
+ * Extend a parent {@link IgnoreChain} with the `.gitignore` (if any) of the
+ * directory currently being walked. Returns the parent unchanged when the scope
+ * opts out of gitignore handling or the directory carries no rules.
+ */
+async function extendChain(
+	parent: IgnoreChain,
+	dirUri: vscode.Uri,
+	rel: string,
+	filter: ScopeFilter,
+	entries: readonly [string, vscode.FileType][]
+): Promise<IgnoreChain> {
+	if (!filter.respectGitignore) return parent;
+	const hasGitignore = entries.some(([n, t]) => !!(t & vscode.FileType.File) && n === GITIGNORE_REL);
+	const rules = await rulesForDir(dirUri, hasGitignore);
+	return rules.length ? [...parent, { baseRel: rel, rules }] : parent;
+}
+
+/**
+ * Reconstruct the {@link IgnoreChain} for a single scope-relative path with no
+ * walk context — used by the live watcher. Pulls each ancestor directory's
+ * rules (scope root down to the path's parent) from {@link gitignoreCache},
+ * reading lazily on a miss. Empty when the scope opts out of gitignore handling.
+ */
+async function chainForPath(job: SyncJob, relInScope: string): Promise<IgnoreChain> {
+	if (!job.filter.respectGitignore) return [];
+	const segments = relInScope ? relInScope.split("/") : [];
+	const dirs = [""];
+	for (let i = 0; i < segments.length - 1; i++) dirs.push(segments.slice(0, i + 1).join("/"));
+	const chain: IgnoreScope[] = [];
+	for (const dir of dirs) {
+		const dirUri = dir ? vscode.Uri.joinPath(job.remoteRoot, dir) : job.remoteRoot;
+		const rules = await rulesForDir(dirUri);
+		if (rules.length) chain.push({ baseRel: dir, rules });
+	}
+	return chain;
 }
 
 /**
@@ -1201,12 +1234,14 @@ function resolveExtraScopes(extras: readonly string[] | undefined, packageRel: s
 	return out;
 }
 
-/** Build a {@link ScopeFilter} for one scope from its package's config. */
-async function buildScopeFilter(remoteRoot: vscode.Uri, cfg: LauncherConfig | undefined): Promise<ScopeFilter> {
-	const respectGit = cfg?.respectGitignore !== false;
-	const ignoreRules = respectGit ? await loadGitignore(remoteRoot) : [];
+/**
+ * Build a {@link ScopeFilter} for one scope from its package's config. The
+ * `.gitignore` rules are read lazily during the walk (see {@link extendChain}),
+ * not here, so this is a pure transform of the config.
+ */
+function buildScopeFilter(cfg: LauncherConfig | undefined): ScopeFilter {
 	return {
-		ignoreRules,
+		respectGitignore: cfg?.respectGitignore !== false,
 		excludeFiles: [...DEFAULT_FILE_EXCLUDES, ...(cfg?.excludeFiles ?? [])],
 		includeFiles: cfg?.includeFiles ?? []
 	};
@@ -1514,10 +1549,13 @@ async function mirrorSubtree(
 	mirror: string,
 	excludes: readonly string[],
 	filter: ScopeFilter,
+	chain: IgnoreChain,
 	kept?: Set<string>
 ): Promise<number> {
 	let copied = 0;
 	const entries = await vscode.workspace.fs.readDirectory(remoteDir);
+	// Honor a `.gitignore` in this directory (and every ancestor already in `chain`).
+	const chainHere = await extendChain(chain, remoteDir, rel, filter, entries);
 	for (const [name, type] of entries) {
 		if (isExcluded(name, excludes)) continue;
 		// Don't follow symlinks: across an SSH bridge they can point anywhere
@@ -1528,9 +1566,9 @@ async function mirrorSubtree(
 		const isDir = !!(type & vscode.FileType.Directory);
 		const isFile = !!(type & vscode.FileType.File);
 		const forced = matchesAnyGlob(filter.includeFiles, name, childRel);
-		if (!forced && isGitignored(filter.ignoreRules, childRel, isDir)) continue;
+		if (!forced && decideIgnored(chainHere, childRel, isDir)) continue;
 		if (isDir) {
-			copied += await mirrorSubtree(childRemote, childRel, mirror, excludes, filter, kept);
+			copied += await mirrorSubtree(childRemote, childRel, mirror, excludes, filter, chainHere, kept);
 		} else if (isFile) {
 			if (!forced && matchesAnyGlob(filter.excludeFiles, name, childRel)) continue;
 			kept?.add(childRel);
@@ -1570,6 +1608,7 @@ async function scanRemote(
 	visited: Set<string>,
 	excludes: readonly string[],
 	filter: ScopeFilter,
+	chain: IgnoreChain,
 	onProgress: (count: number) => void
 ): Promise<void> {
 	if (token.isCancellationRequested) return;
@@ -1583,6 +1622,8 @@ async function scanRemote(
 		output.appendLine(`[deskport] scan skipped ${rel || "."}: ${(err as Error).message}`);
 		return;
 	}
+	// Honor a `.gitignore` in this directory (and every ancestor already in `chain`).
+	const chainHere = await extendChain(chain, remoteDir, rel, filter, entries);
 	for (const [name, type] of entries) {
 		if (token.isCancellationRequested) return;
 		if (isExcluded(name, excludes)) continue;
@@ -1595,9 +1636,9 @@ async function scanRemote(
 		// back in even when a `.gitignore` or the default file-exclude list
 		// would otherwise skip it — segment-level `excludes` still apply.
 		const forced = matchesAnyGlob(filter.includeFiles, name, childRel);
-		if (!forced && isGitignored(filter.ignoreRules, childRel, isDir)) continue;
+		if (!forced && decideIgnored(chainHere, childRel, isDir)) continue;
 		if (isDir) {
-			await scanRemote(childUri, childRel, files, token, visited, excludes, filter, onProgress);
+			await scanRemote(childUri, childRel, files, token, visited, excludes, filter, chainHere, onProgress);
 		} else if (isFile) {
 			if (!forced && matchesAnyGlob(filter.excludeFiles, name, childRel)) continue;
 			try {
@@ -1698,6 +1739,10 @@ async function syncAll(
 ): Promise<SyncResult> {
 	type ScannedJob = SyncJob & { found: ScannedFile[]; totalBytes: number };
 	const scanned: ScannedJob[] = [];
+	// Re-read every `.gitignore` fresh for this launch: drop rules cached by a
+	// prior launch (whose watcher may have torn down before a remote edit), then
+	// let the walk and its live watcher share reads within this session.
+	gitignoreCache.clear();
 	for (const job of jobs) {
 		progress.report({ message: `scanning ${job.label}…` });
 		output.appendLine(`[deskport] scanning ${job.label}…`);
@@ -1714,7 +1759,7 @@ async function syncAll(
 			}
 		} else {
 			let lastScanReport = 0;
-			await scanRemote(job.remoteRoot, "", files, token, new Set<string>(), job.excludes, job.filter, (count) => {
+			await scanRemote(job.remoteRoot, "", files, token, new Set<string>(), job.excludes, job.filter, [], (count) => {
 				const now = Date.now();
 				if (now - lastScanReport >= 200) {
 					progress.report({ message: `scanning ${job.label} — ${count} files found…` });
@@ -1835,12 +1880,25 @@ async function onScopeEvent(job: SyncJob, uri: vscode.Uri, kind: "upsert" | "del
 	const segments = relInScope ? relInScope.split("/") : [];
 	if (segments.some((seg) => isExcluded(seg, job.excludes))) return;
 	const name = segments[segments.length - 1] ?? "";
+	// A changed `.gitignore` invalidates the cached rules for its own directory,
+	// so the chain reflects the edit on the next event (and the next launch's
+	// cold sync re-reads it from scratch).
+	if (name === GITIGNORE_REL) {
+		const dirRel = segments.slice(0, -1).join("/");
+		const dirUri = dirRel ? vscode.Uri.joinPath(job.remoteRoot, dirRel) : job.remoteRoot;
+		gitignoreCache.delete(dirUri.toString());
+	}
 	const forced = matchesAnyGlob(job.filter.includeFiles, name, relInScope);
+	// The chain of `.gitignore` rule-sets from the scope root down to this path's
+	// parent, rebuilt from the cache the cold sync warmed (empty when the scope
+	// opts out). Reused below so a directory create filters its children with the
+	// full ancestor context.
+	const chain = await chainForPath(job, relInScope);
 	if (!forced) {
 		if (kind === "upsert" && matchesAnyGlob(job.filter.excludeFiles, name, relInScope)) return;
 		// isDir=false: the watcher fires per file; a directory matching a
 		// gitignore rule has children whose paths match the same rule (or a prefix).
-		if (isGitignored(job.filter.ignoreRules, relInScope, false)) return;
+		if (decideIgnored(chain, relInScope, false)) return;
 	}
 	const localPath = relInScope ? join(job.localRoot, relInScope) : job.localRoot;
 	try {
@@ -1850,7 +1908,7 @@ async function onScopeEvent(job: SyncJob, uri: vscode.Uri, kind: "upsert" | "del
 		}
 		const remoteStat = await vscode.workspace.fs.stat(uri);
 		if (remoteStat.type & vscode.FileType.Directory) {
-			await mirrorSubtree(uri, relInScope, job.localRoot, job.excludes, job.filter);
+			await mirrorSubtree(uri, relInScope, job.localRoot, job.excludes, job.filter, chain);
 		} else {
 			await mirrorFile(uri, localPath);
 		}
@@ -2140,7 +2198,7 @@ async function launchTarget(id: string): Promise<void> {
 			const buildJob = async (scope: string, remoteRoot: vscode.Uri, label: string): Promise<SyncJob> => {
 				const localRoot = mirrorDirForAbs(ws, remoteRoot.path);
 				await mkdir(localRoot, { recursive: true });
-				const filter = await buildScopeFilter(remoteRoot, rt.pkg.config);
+				const filter = buildScopeFilter(rt.pkg.config);
 				return { scope, remoteRoot, localRoot, label, excludes: scopeExcludes(rt.pkg.config), filter };
 			};
 
@@ -2185,7 +2243,7 @@ async function launchTarget(id: string): Promise<void> {
 							localRoot: rootMirror,
 							label: "workspace manifests",
 							excludes: scopeExcludes(rt.pkg.config),
-							filter: { ignoreRules: [], excludeFiles: [], includeFiles: [] },
+							filter: { respectGitignore: false, excludeFiles: [], includeFiles: [] },
 							files: PNPM_ROOT_FILES
 						}
 					];
@@ -2703,3 +2761,27 @@ function error(message: string): void {
 function info(message: string): void {
 	void vscode.window.showInformationMessage(`DeskPort: ${message}`);
 }
+
+/**
+ * Test-only handle on the sync-walk internals exercised by tests/walk.test.js.
+ *
+ * Not part of the extension's public API — VSCode only ever calls
+ * {@link activate} / {@link deactivate}. Bundled in one object so the real
+ * surface stays clear, and so the walk (which is deeply entangled with module
+ * helpers like {@link isExcluded}, {@link mirrorFile}, and the
+ * {@link gitignoreCache}) can be driven against an in-memory `vscode` fake
+ * without extracting the whole engine.
+ */
+export const __test = {
+	scanRemote,
+	mirrorSubtree,
+	onScopeEvent,
+	buildScopeFilter,
+	chainForPath,
+	rulesForDir,
+	gitignoreCache,
+	/** Inject a no-op (or spy) output channel; `output` is otherwise only set in {@link activate}. */
+	setOutput(channel: vscode.OutputChannel): void {
+		output = channel;
+	}
+};

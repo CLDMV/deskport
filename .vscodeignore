@@ -1,6 +1,7 @@
 # Source & tooling — never shipped
 .configs/**
 src/**
+tests/**
 examples/**
 docs/**
 node_modules/**

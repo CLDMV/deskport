@@ -5,6 +5,17 @@ All notable changes to the DeskPort extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-27
+
+### Added
+
+- **`.gitignore` is now honored at every directory level, matching git's per-directory model.** Previously DeskPort read a single `.gitignore` at the scope root and applied that one flat rule list across the entire mirror walk, so a `.gitignore` in any subdirectory was never consulted. This was most visible for pnpm-workspace apps, where the scope root is the workspace root — often not a git repo and carrying no root `.gitignore` — so per-repo `.gitignore`s one level down (e.g. `rummage/.gitignore` listing `tmp/`) were ignored and scratch directories got mirrored. DeskPort now reads the `.gitignore` in each directory as it walks, interpreting its patterns relative to that directory and letting deeper files take precedence, exactly as git does. The cold sync, the incremental subtree copy, and the live file watcher share one per-directory rule cache (cleared at the start of each launch), so a `.gitignore` is read at most once per launch and only for directories that actually contain one.
+- **`tmp` and `.tmp` are now part of the always-on default excludes**, so scratch directories never mirror even when no `.gitignore` exists anywhere on the path.
+
+### Changed
+
+- **`.gitignore` negation (`!pattern`) is now respected.** A re-include such as `!keep.log` under a broader `*.log` ignore correctly keeps the matched path at any depth. Earlier releases silently dropped every `!` line, so a negated pattern had no effect — anything its parent pattern ignored stayed ignored. Configs that relied on `!` lines being a no-op will now see those paths mirrored. `respectGitignore: false` still disables the whole gitignore layer, and a target's `includeFiles` still force-includes regardless.
+
 ## [0.9.7] - 2026-05-24
 
 ### Added

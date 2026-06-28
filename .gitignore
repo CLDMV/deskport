@@ -148,3 +148,6 @@ out/
 
 # DeskPort runtime trigger file
 **/.deskport/trigger.json
+
+# Scratch / throwaway working dir (also used by integration tests)
+tmp/
